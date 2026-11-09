@@ -14,7 +14,7 @@ use crossterm::terminal::{
 use crossterm::{execute, queue};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -169,10 +169,8 @@ struct Session {
     /// A load that started before the applied one is stale.
     seq: u64,
     applied_seq: u64,
-    /// While a write runs, key presses wait in `held` and run afterwards,
-    /// against the refreshed data.
+    /// One `bd` write at a time; the UI stays live while it runs.
     writing: bool,
-    held: VecDeque<Event>,
     reloads: usize,
     listing_panes: bool,
     next_reload: Instant,
@@ -222,7 +220,7 @@ impl Session {
         write: impl FnOnce(&Bd) -> io::Result<String> + Send + 'static,
     ) {
         self.writing = true;
-        self.app.set_status(busy);
+        self.app.set_busy(Some(busy));
         self.seq += 1;
         let seq = self.seq;
         let bd = self.bd.clone();
@@ -253,6 +251,7 @@ impl Session {
                 result,
             } => {
                 self.writing = false;
+                self.app.set_busy(None);
                 self.dirty = true;
                 match result {
                     Err(error) => self.app.set_status(error.to_string()),
@@ -340,6 +339,19 @@ impl Session {
 
     /// Carries out an action from the app; returns true to quit.
     fn act(&mut self, action: Action) -> io::Result<bool> {
+        let writes = matches!(
+            action,
+            Action::CloseIssue(_)
+                | Action::SetStatus(..)
+                | Action::SetPriority(..)
+                | Action::CreateIssue(_)
+                | Action::Edit(_)
+        );
+        if writes && self.writing {
+            let busy = self.app.status_message().unwrap_or_default().to_string();
+            self.app.set_status(format!("wait: {busy}"));
+            return Ok(false);
+        }
         match action {
             Action::Quit => return Ok(true),
             Action::None => {}
@@ -454,7 +466,9 @@ impl Session {
                     if is_ctrl_c(&event) {
                         return Ok(());
                     }
-                    self.held.push_back(event);
+                    if self.handle_event(event)? {
+                        return Ok(());
+                    }
                     if !event::poll(Duration::ZERO)? {
                         break;
                     }
@@ -465,19 +479,10 @@ impl Session {
                 self.finish(done);
             }
 
-            while !self.writing {
-                let Some(event) = self.held.pop_front() else {
-                    break;
-                };
-                if self.handle_event(event)? {
-                    return Ok(());
-                }
-            }
-            if !self.writing
-                && self
-                    .app
-                    .pending_key_timeout()
-                    .is_some_and(|remaining| remaining.is_zero())
+            if self
+                .app
+                .pending_key_timeout()
+                .is_some_and(|remaining| remaining.is_zero())
             {
                 self.dirty = true;
                 let action = self.app.flush_pending_key();
@@ -604,7 +609,6 @@ fn run(bd: Bd) -> io::Result<()> {
         seq: 0,
         applied_seq: 0,
         writing: false,
-        held: VecDeque::new(),
         reloads: 0,
         listing_panes: false,
         next_reload: now + RELOAD_INTERVAL,

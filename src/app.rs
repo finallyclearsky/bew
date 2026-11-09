@@ -185,6 +185,9 @@ pub struct App {
     history: Vec<DetailFrame>,
     edit_key_started: Option<Instant>,
     status_message: Option<String>,
+    /// What bew is waiting for; shows when there is no status message, and
+    /// keys do not clear it.
+    busy: Option<String>,
     statuses: Vec<String>,
     /// Bead ID → tmux pane ID, for the beads that have a live agent pane.
     panes: HashMap<String, String>,
@@ -205,6 +208,7 @@ impl App {
             history: Vec::new(),
             edit_key_started: None,
             status_message: None,
+            busy: None,
             statuses: DEFAULT_STATUSES.map(str::to_string).to_vec(),
             panes: HashMap::new(),
             tmux: false,
@@ -317,7 +321,11 @@ impl App {
     }
 
     pub fn status_message(&self) -> Option<&str> {
-        self.status_message.as_deref()
+        self.status_message.as_deref().or(self.busy.as_deref())
+    }
+
+    pub fn set_busy(&mut self, busy: Option<String>) {
+        self.busy = busy;
     }
 
     pub fn set_status(&mut self, message: String) {
@@ -1480,6 +1488,21 @@ mod tests {
             app.handle_key(key(KeyCode::Char('t'))),
             Action::Edit(EditField::Title)
         );
+    }
+
+    #[test]
+    fn the_busy_text_survives_keys_and_yields_to_a_status_message() {
+        let mut app = App::new(graph());
+        app.set_busy(Some("Closing a…".to_string()));
+
+        app.handle_key(key(KeyCode::Char('j')));
+        assert_eq!(app.status_message(), Some("Closing a…"));
+        app.set_status("Set a to P1".to_string());
+        assert_eq!(app.status_message(), Some("Set a to P1"));
+
+        app.set_busy(None);
+        app.handle_key(key(KeyCode::Char('k')));
+        assert_eq!(app.status_message(), None);
     }
 
     #[test]
