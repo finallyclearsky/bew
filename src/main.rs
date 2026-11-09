@@ -54,9 +54,9 @@ Steps:     status, priority, close and add issue replace the screen.
 Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for text
            Backspace returns to the previous selection · Esc asks before discarding
 
-Agents:    a opens a claude /ship command in $EDITOR. On save, bew runs it in a
-           new tmux pane to the right and binds the pane to the issue. An empty
-           file cancels. bew does not change the issue itself.
+Agents:    a opens a claude /ship command in $EDITOR. On write, bew runs it in a
+           new tmux pane to the right and binds the pane to the issue. Quitting
+           without writing cancels. bew does not change the issue itself.
            f shows the bound pane. ● marks issues with a live pane.
 
 Refresh:   bew reloads after each action and when the terminal gains focus
@@ -397,7 +397,8 @@ impl Session {
                 let result = edit_text(&initial, "md");
                 self.tui.enter()?;
                 match result {
-                    Ok(value) => self.app.set_add_issue_field(field, value),
+                    Ok(Some(value)) => self.app.set_add_issue_field(field, value),
+                    Ok(None) => {}
                     Err(error) => self.app.set_status(error.to_string()),
                 }
             }
@@ -405,12 +406,18 @@ impl Session {
                 self.tui.leave()?;
                 let result = edit_text(&command, "sh");
                 self.tui.enter()?;
-                // An empty file or a failed editor (vim :cq) cancels.
+                // Quitting without writing, an empty file or a failed editor
+                // (vim :cq) cancels.
                 let command = match result {
-                    Ok(command) if !command.trim().is_empty() => command.trim().to_string(),
-                    Ok(_) => {
+                    Ok(Some(command)) if !command.trim().is_empty() => command.trim().to_string(),
+                    Ok(Some(_)) => {
                         self.app
                             .set_status("empty command · no pane started".to_string());
+                        return Ok(false);
+                    }
+                    Ok(None) => {
+                        self.app
+                            .set_status("not written · no pane started".to_string());
                         return Ok(false);
                     }
                     Err(error) => {
@@ -541,9 +548,10 @@ fn parse_args() -> Result<Option<Bd>, String> {
     Ok(Some(Bd::new(bd, db)))
 }
 
-/// Opens `initial` in `$VISUAL`/`$EDITOR` and returns the saved text. The
-/// file extension selects the editor's syntax highlighting.
-fn edit_text(initial: &str, extension: &str) -> io::Result<String> {
+/// Opens `initial` in `$VISUAL`/`$EDITOR` and returns the text, or `None`
+/// when the editor quit without writing. The file extension selects the
+/// editor's syntax highlighting.
+fn edit_text(initial: &str, extension: &str) -> io::Result<Option<String>> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -552,6 +560,13 @@ fn edit_text(initial: &str, extension: &str) -> io::Result<String> {
     fs::write(&path, initial)?;
 
     let result = (|| {
+        // Any write sets the modification time to now, even one that keeps
+        // the text, so a time still in the past means the user quit.
+        let unwritten = UNIX_EPOCH + Duration::from_secs(1);
+        fs::File::options()
+            .write(true)
+            .open(&path)?
+            .set_modified(unwritten)?;
         let status = Command::new("sh")
             .args(["-c", "exec ${VISUAL:-${EDITOR:-vi}} \"$1\"", "bew-editor"])
             .arg(&path)
@@ -562,7 +577,10 @@ fn edit_text(initial: &str, extension: &str) -> io::Result<String> {
         if !status.success() {
             return Err(io::Error::other(format!("editor failed: {status}")));
         }
-        fs::read_to_string(&path)
+        if fs::metadata(&path)?.modified()? == unwritten {
+            return Ok(None);
+        }
+        fs::read_to_string(&path).map(Some)
     })();
     let _ = fs::remove_file(&path);
     result

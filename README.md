@@ -39,7 +39,7 @@ In a step (status, priority, close, add issue), `Enter` applies and `Esc` cancel
 
 ## Agents
 
-bew must run inside tmux. Press `a` to open `claude --effort medium "/ship <short-id>"` in `$EDITOR`. Edit it and save to run it; save an empty file to cancel. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
+bew must run inside tmux. Press `a` to open `claude --effort medium "/ship <short-id>"` in `$EDITOR`. To run it, write the file. To cancel, quit without writing. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
 
 Press `f` to show the issue's pane again. A `●` marks issues with a live pane.
 
