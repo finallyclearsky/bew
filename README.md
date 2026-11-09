@@ -39,7 +39,7 @@ In a step (status, priority, close, add issue, agent command), `Enter` applies a
 
 ## Agents
 
-bew must run inside tmux. Press `a` and type the full command, for example `claude "/ship bew-12"`. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
+bew must run inside tmux. Press `a` to get the command `claude --effort medium "/ship <short-id>"`. Edit it or press Ctrl-U to clear it, then press Enter. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
 
 Press `f` to show the issue's pane again. A `●` marks issues with a live pane.
 

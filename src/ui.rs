@@ -406,7 +406,7 @@ fn draw_step(app: &App, step: &Step, buffer: &mut Buffer, area: Rect) {
             (
                 format!("Start agent · {issue_id}"),
                 lines,
-                "Type or paste a command · Enter run · Ctrl-U clear · Esc cancel".to_string(),
+                "Edit or paste the command · Enter run · Ctrl-U clear · Esc cancel".to_string(),
             )
         }
     };
@@ -897,11 +897,11 @@ mod tests {
         let mut app = app();
         app.set_tmux(true);
         press(&mut app, KeyCode::Char('a'));
-        app.handle_paste("claude \"/ship task-1\"");
+        app.handle_paste(" --verbose");
 
         let screen = render(&mut app, 80, 20);
         assert!(screen.starts_with(" Start agent · task-1"));
-        assert!(screen.contains("> claude \"/ship task-1\"▏"));
+        assert!(screen.contains("> claude --effort medium \"/ship 1\" --verbose▏"));
     }
 
     #[test]

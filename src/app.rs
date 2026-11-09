@@ -688,10 +688,8 @@ impl App {
             self.set_status("agent panes need tmux: run bew inside tmux".to_string());
             return;
         }
-        self.mode = Mode::Step(Step::Command {
-            issue_id,
-            input: String::new(),
-        });
+        let input = agent_command(&issue_id);
+        self.mode = Mode::Step(Step::Command { issue_id, input });
     }
 
     fn focus_agent(&mut self) -> Action {
@@ -1160,6 +1158,15 @@ fn handle_add_issue_key(flow: &mut AddIssueFlow, key: KeyEvent, plain: bool) -> 
         },
     }
     (Action::None, false)
+}
+
+/// The command the agent step starts with. `/ship` takes the short ID: the
+/// part after the workspace prefix (`2ybw.118` for `lifeline-2ybw.118`).
+fn agent_command(issue_id: &str) -> String {
+    let short_id = issue_id
+        .rsplit_once('-')
+        .map_or(issue_id, |(_, short_id)| short_id);
+    format!("claude --effort medium \"/ship {short_id}\"")
 }
 
 /// The option index of `issue`'s current value, if it is one of `options`.
@@ -1881,25 +1888,29 @@ mod tests {
 
     #[test]
     fn a_opens_a_command_step_that_starts_an_agent() {
-        let mut app = App::new(graph());
+        let mut app = App::new(IssueGraph::new(vec![plain("lifeline-2ybw.118")], vec![]));
         app.set_tmux(true);
 
         app.handle_key(key(KeyCode::Char('a')));
-        assert!(matches!(app.step(), Some(Step::Command { issue_id, .. }) if issue_id == "a"));
+        assert!(matches!(app.step(), Some(Step::Command { issue_id, input })
+            if issue_id == "lifeline-2ybw.118"
+                && input == "claude --effort medium \"/ship 2ybw.118\""));
+
+        app.handle_key(ctrl('u'));
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Action::None,
             "an empty command does nothing"
         );
 
-        type_text(&mut app, "claude \"/ship a\"x");
+        type_text(&mut app, "codex x");
         app.handle_key(key(KeyCode::Backspace));
-        app.handle_paste(" --effort\nhigh");
+        app.handle_paste("--model\nfast");
         assert_eq!(
             app.handle_key(key(KeyCode::Enter)),
             Action::StartAgent {
-                issue_id: "a".into(),
-                command: "claude \"/ship a\" --effort high".into(),
+                issue_id: "lifeline-2ybw.118".into(),
+                command: "codex --model fast".into(),
             }
         );
         assert!(app.step().is_none());
