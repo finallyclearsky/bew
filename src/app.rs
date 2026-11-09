@@ -127,15 +127,8 @@ pub struct Choice {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
     Choose(Choice),
-    Close {
-        issue_id: String,
-    },
+    Close { issue_id: String },
     AddIssue(AddIssueFlow),
-    /// The command to run in a new tmux pane bound to the issue.
-    Command {
-        issue_id: String,
-        input: String,
-    },
 }
 
 impl Step {
@@ -143,7 +136,7 @@ impl Step {
     fn issue_id(&self) -> Option<&str> {
         match self {
             Self::Choose(choice) => Some(&choice.issue_id),
-            Self::Close { issue_id } | Self::Command { issue_id, .. } => Some(issue_id),
+            Self::Close { issue_id } => Some(issue_id),
             Self::AddIssue(_) => None,
         }
     }
@@ -159,7 +152,8 @@ pub enum Action {
     CreateIssue(AddIssueDraft),
     SetStatus(String, String),
     SetPriority(String, i32),
-    /// Run `command` in a new tmux pane and bind the pane to the issue.
+    /// Open `command` in `$EDITOR`; run what is saved in a new tmux pane
+    /// bound to the issue.
     StartAgent {
         issue_id: String,
         command: String,
@@ -412,7 +406,6 @@ impl App {
                 query.push_str(line.trim());
                 self.rebuild_search_rows();
             }
-            Mode::Step(Step::Command { input, .. }) => input.push_str(&line),
             Mode::Step(Step::AddIssue(flow)) if !flow.confirming_cancel => match flow.step {
                 AddIssueStep::Title => flow.title.push_str(&line),
                 AddIssueStep::Description => flow.description.push_str(text),
@@ -432,7 +425,7 @@ impl App {
             KeyCode::Char('s') => self.start_choice(ChoiceKind::Status),
             KeyCode::Char('p') => self.start_choice(ChoiceKind::Priority),
             KeyCode::Char('x') => self.start_close_confirmation(),
-            KeyCode::Char('a') => self.start_command(),
+            KeyCode::Char('a') => return Some(self.start_agent()),
             KeyCode::Char('f') => return Some(self.focus_agent()),
             _ => return None,
         }
@@ -603,26 +596,6 @@ impl App {
                 }
                 return action;
             }
-            Step::Command { issue_id, input } => match key.code {
-                KeyCode::Esc => Some(Action::None),
-                KeyCode::Enter if !input.trim().is_empty() => Some(Action::StartAgent {
-                    issue_id: issue_id.clone(),
-                    command: input.trim().to_string(),
-                }),
-                KeyCode::Backspace => {
-                    input.pop();
-                    None
-                }
-                KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    input.clear();
-                    None
-                }
-                KeyCode::Char(character) if plain => {
-                    input.push(character);
-                    None
-                }
-                _ => None,
-            },
         };
         // `Some` means the step is done, applied or cancelled.
         match action {
@@ -680,16 +653,16 @@ impl App {
         }));
     }
 
-    fn start_command(&mut self) {
+    fn start_agent(&mut self) -> Action {
         let Some(issue_id) = self.current_issue().map(|issue| issue.id.clone()) else {
-            return;
+            return Action::None;
         };
         if !self.tmux {
             self.set_status("agent panes need tmux: run bew inside tmux".to_string());
-            return;
+            return Action::None;
         }
-        let input = agent_command(&issue_id);
-        self.mode = Mode::Step(Step::Command { issue_id, input });
+        let command = agent_command(&issue_id);
+        Action::StartAgent { issue_id, command }
     }
 
     fn focus_agent(&mut self) -> Action {
@@ -1160,7 +1133,7 @@ fn handle_add_issue_key(flow: &mut AddIssueFlow, key: KeyEvent, plain: bool) -> 
     (Action::None, false)
 }
 
-/// The command the agent step starts with. `/ship` takes the short ID: the
+/// The command `a` opens in `$EDITOR`. `/ship` takes the short ID: the
 /// part after the workspace prefix (`2ybw.118` for `lifeline-2ybw.118`).
 fn agent_command(issue_id: &str) -> String {
     let short_id = issue_id
@@ -1255,10 +1228,6 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
-    fn ctrl(character: char) -> KeyEvent {
-        KeyEvent::new(KeyCode::Char(character), KeyModifiers::CONTROL)
     }
 
     fn type_text(app: &mut App, text: &str) {
@@ -1887,45 +1856,17 @@ mod tests {
     }
 
     #[test]
-    fn a_opens_a_command_step_that_starts_an_agent() {
+    fn a_offers_a_ship_command_for_the_short_id() {
         let mut app = App::new(IssueGraph::new(vec![plain("lifeline-2ybw.118")], vec![]));
         app.set_tmux(true);
 
-        app.handle_key(key(KeyCode::Char('a')));
-        assert!(matches!(app.step(), Some(Step::Command { issue_id, input })
-            if issue_id == "lifeline-2ybw.118"
-                && input == "claude --effort medium \"/ship 2ybw.118\""));
-
-        app.handle_key(ctrl('u'));
         assert_eq!(
-            app.handle_key(key(KeyCode::Enter)),
-            Action::None,
-            "an empty command does nothing"
-        );
-
-        type_text(&mut app, "codex x");
-        app.handle_key(key(KeyCode::Backspace));
-        app.handle_paste("--model\nfast");
-        assert_eq!(
-            app.handle_key(key(KeyCode::Enter)),
+            app.handle_key(key(KeyCode::Char('a'))),
             Action::StartAgent {
                 issue_id: "lifeline-2ybw.118".into(),
-                command: "codex --model fast".into(),
+                command: "claude --effort medium \"/ship 2ybw.118\"".into(),
             }
         );
-        assert!(app.step().is_none());
-    }
-
-    #[test]
-    fn ctrl_u_clears_and_escape_cancels_the_command_step() {
-        let mut app = App::new(graph());
-        app.set_tmux(true);
-        app.handle_key(key(KeyCode::Char('a')));
-        type_text(&mut app, "make");
-
-        app.handle_key(ctrl('u'));
-        assert!(matches!(app.step(), Some(Step::Command { input, .. }) if input.is_empty()));
-        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
         assert!(app.step().is_none());
     }
 

@@ -35,11 +35,11 @@ Run `bew` anywhere that `bd list` works. Options: `--db path/to/.beads` selects 
 | `Esc` | Quit | Return to tree |
 | `q` | Quit | Quit |
 
-In a step (status, priority, close, add issue, agent command), `Enter` applies and `Esc` cancels. In a text field, press `e` while it is empty to use `$EDITOR`.
+In a step (status, priority, close, add issue), `Enter` applies and `Esc` cancels. In a text field, press `e` while it is empty to use `$EDITOR`.
 
 ## Agents
 
-bew must run inside tmux. Press `a` to get the command `claude --effort medium "/ship <short-id>"`. Edit it or press Ctrl-U to clear it, then press Enter. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
+bew must run inside tmux. Press `a` to open `claude --effort medium "/ship <short-id>"` in `$EDITOR`. Edit it and save to run it; save an empty file to cancel. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
 
 Press `f` to show the issue's pane again. A `●` marks issues with a live pane.
 

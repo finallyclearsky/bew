@@ -388,27 +388,6 @@ fn draw_step(app: &App, step: &Step, buffer: &mut Buffer, area: Rect) {
             "y close · n/Esc cancel".to_string(),
         ),
         Step::AddIssue(flow) => add_issue_step(flow, area.width as usize),
-        Step::Command { issue_id, input } => {
-            let mut lines = vec![
-                issue_title_line(app, issue_id),
-                Line::blank(),
-                Line::plain(format!(
-                    "Command to run in a new tmux pane next to bew. The pane is bound to {issue_id}."
-                )),
-                Line::new("bew does not change the issue; the command does what it needs.", dim()),
-                Line::blank(),
-            ];
-            lines.extend(
-                hard_wrap(&format!("> {input}▏"), area.width as usize)
-                    .into_iter()
-                    .map(|text| Line::new(text, bold())),
-            );
-            (
-                format!("Start agent · {issue_id}"),
-                lines,
-                "Edit or paste the command · Enter run · Ctrl-U clear · Esc cancel".to_string(),
-            )
-        }
     };
 
     put_line(
@@ -890,18 +869,6 @@ mod tests {
         assert!(screen.contains("› open"));
         assert!(screen.contains("  in_progress"));
         assert!(screen.contains("Enter apply"));
-    }
-
-    #[test]
-    fn command_step_shows_the_typed_command() {
-        let mut app = app();
-        app.set_tmux(true);
-        press(&mut app, KeyCode::Char('a'));
-        app.handle_paste(" --verbose");
-
-        let screen = render(&mut app, 80, 20);
-        assert!(screen.starts_with(" Start agent · task-1"));
-        assert!(screen.contains("> claude --effort medium \"/ship 1\" --verbose▏"));
     }
 
     #[test]

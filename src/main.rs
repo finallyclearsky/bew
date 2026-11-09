@@ -48,14 +48,15 @@ Task view: j/k dependency · Enter open · Backspace back · Esc tree · q quit
 Both:      e edit description · et edit title · s set status · p set priority
            + add child · x close issue · a start agent · f focus agent
 
-Steps:     status, priority, close, add issue and agent replace the screen.
+Steps:     status, priority, close and add issue replace the screen.
            Enter applies, Esc cancels; both return to where you were.
 
 Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for text
            Backspace returns to the previous selection · Esc asks before discarding
 
-Agents:    a asks for a command, runs it in a new tmux pane to the right and
-           binds the pane to the issue. bew does not change the issue itself.
+Agents:    a opens a claude /ship command in $EDITOR. On save, bew runs it in a
+           new tmux pane to the right and binds the pane to the issue. An empty
+           file cancels. bew does not change the issue itself.
            f shows the bound pane. ● marks issues with a live pane.
 
 Refresh:   bew reloads after each action and when the terminal gains focus
@@ -393,7 +394,7 @@ impl Session {
             Action::EditAddIssue(field) => {
                 let initial = self.app.add_issue_field(field).unwrap_or("").to_string();
                 self.tui.leave()?;
-                let result = edit_add_issue_field(&initial);
+                let result = edit_text(&initial, "md");
                 self.tui.enter()?;
                 match result {
                     Ok(value) => self.app.set_add_issue_field(field, value),
@@ -401,6 +402,22 @@ impl Session {
                 }
             }
             Action::StartAgent { issue_id, command } => {
+                self.tui.leave()?;
+                let result = edit_text(&command, "sh");
+                self.tui.enter()?;
+                // An empty file or a failed editor (vim :cq) cancels.
+                let command = match result {
+                    Ok(command) if !command.trim().is_empty() => command.trim().to_string(),
+                    Ok(_) => {
+                        self.app
+                            .set_status("empty command · no pane started".to_string());
+                        return Ok(false);
+                    }
+                    Err(error) => {
+                        self.app.set_status(format!("{error} · no pane started"));
+                        return Ok(false);
+                    }
+                };
                 self.app
                     .set_status(format!("Starting a pane for {issue_id}…"));
                 let cwd = env::current_dir()?;
@@ -524,12 +541,14 @@ fn parse_args() -> Result<Option<Bd>, String> {
     Ok(Some(Bd::new(bd, db)))
 }
 
-fn edit_add_issue_field(initial: &str) -> io::Result<String> {
+/// Opens `initial` in `$VISUAL`/`$EDITOR` and returns the saved text. The
+/// file extension selects the editor's syntax highlighting.
+fn edit_text(initial: &str, extension: &str) -> io::Result<String> {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = env::temp_dir().join(format!("bew-add-{}-{nonce}.md", std::process::id()));
+    let path = env::temp_dir().join(format!("bew-{}-{nonce}.{extension}", std::process::id()));
     fs::write(&path, initial)?;
 
     let result = (|| {
