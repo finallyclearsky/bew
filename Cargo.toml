@@ -1,16 +1,17 @@
 [package]
-name = "beads-explorer"
-version = "0.1.0"
+name = "bew"
+version = "0.2.0"
 edition = "2021"
-description = "A fast terminal explorer for beads issue graphs"
+description = "Beads Workspace: a tmux-native terminal workspace for beads issues"
 license = "MIT"
 
 [[bin]]
-name = "be"
+name = "bew"
 path = "src/main.rs"
 
 [dependencies]
 crossterm = "0.29"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 unicode-width = "0.2"
@@ -18,4 +19,3 @@ unicode-width = "0.2"
 [profile.release]
 strip = true
 lto = true
-

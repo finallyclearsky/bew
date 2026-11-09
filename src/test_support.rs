@@ -25,8 +25,8 @@ impl FakeBd {
             .as_nanos();
         let directory = std::env::temp_dir();
         let pid = std::process::id();
-        let script = directory.join(format!("be-fake-bd-{tag}-{pid}-{nonce}"));
-        let arguments = directory.join(format!("be-fake-bd-{tag}-args-{pid}-{nonce}"));
+        let script = directory.join(format!("bew-fake-bd-{tag}-{pid}-{nonce}"));
+        let arguments = directory.join(format!("bew-fake-bd-{tag}-args-{pid}-{nonce}"));
         fs::write(
             &script,
             format!(

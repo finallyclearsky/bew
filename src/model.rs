@@ -87,12 +87,18 @@ pub enum JournalHead {
     At(i64),
 }
 
+/// The dependency type that nests a child under its parent in the tree.
+const PARENT_CHILD: &str = "parent-child";
+
+/// The built-in statuses, used until `bd statuses` answers or if it fails.
+pub const DEFAULT_STATUSES: [&str; 5] = ["open", "in_progress", "blocked", "deferred", "closed"];
+
 /// The tree shows open and in-progress issues; the rest are context.
 fn is_listed_status(status: &str) -> bool {
     matches!(status, "open" | "in_progress")
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct IssueGraph {
     issues: HashMap<String, Issue>,
     order: Vec<String>,
@@ -144,10 +150,11 @@ impl IssueGraph {
             map.entry(issue.id.clone()).or_insert(issue);
         }
 
-        // `bd` stores parent-child on the child as a dependency on its parent.
-        // Reverse that relationship for the tree while leaving other dependency
-        // types pointing from an issue to its prerequisite. Only listed issues
-        // shape the tree, so edges to or from context issues are omitted.
+        // Only parent-child links shape the tree. `bd` stores one on the child
+        // as a dependency on its parent, so the edge is reversed here. Blocks
+        // and every other link type are task-level metadata: Task View lists
+        // them, the tree ignores them. Only listed issues shape the tree, so
+        // edges to or from context issues are omitted.
         let mut tree_children: HashMap<String, Vec<String>> = HashMap::new();
         let mut targets = HashSet::new();
         for issue_id in &order {
@@ -155,19 +162,14 @@ impl IssueGraph {
                 continue;
             };
             for dependency in &issue.dependencies {
-                if !listed.contains(&dependency.id) {
+                if dependency.dependency_type != PARENT_CHILD || !listed.contains(&dependency.id) {
                     continue;
                 }
-                let (parent, child) = if dependency.dependency_type == "parent-child" {
-                    (dependency.id.clone(), issue.id.clone())
-                } else {
-                    (issue.id.clone(), dependency.id.clone())
-                };
-                let children = tree_children.entry(parent).or_default();
-                if !children.contains(&child) {
-                    children.push(child.clone());
+                let children = tree_children.entry(dependency.id.clone()).or_default();
+                if !children.contains(&issue.id) {
+                    children.push(issue.id.clone());
                 }
-                targets.insert(child);
+                targets.insert(issue.id.clone());
             }
         }
         let mut roots: Vec<String> = order
@@ -213,25 +215,6 @@ impl IssueGraph {
 
     pub fn len(&self) -> usize {
         self.order.len()
-    }
-
-    pub fn replace_issue(&mut self, issue: Issue) {
-        self.issues.insert(issue.id.clone(), issue);
-    }
-
-    /// Optimistic local mirror of `bd close`: the issue leaves the listed set
-    /// and joins the context issues, so the UI can update before `bd` confirms.
-    pub fn with_issue_closed(&self, issue_id: &str) -> IssueGraph {
-        let closed = self.issues.get(issue_id).map(|issue| Issue {
-            status: "closed".to_string(),
-            ..issue.clone()
-        });
-        self.with_records(&[JournalRecord {
-            op: "close".to_string(),
-            issue_id: issue_id.to_string(),
-            issue: closed,
-            dep: None,
-        }])
     }
 
     /// Replays journal records onto a copy of this graph. Snapshots carry no
@@ -386,16 +369,17 @@ impl Bd {
         Ok(IssueGraph::new(listed, context))
     }
 
-    pub fn load_issue(&self, issue_id: &str) -> io::Result<Issue> {
-        parse_issue_collection(self.run_json(&["show", issue_id, "--json"])?)?
-            .into_iter()
-            .find(|issue| issue.id == issue_id)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("{} show returned no issue {issue_id}", self.name()),
-                )
-            })
+    /// Every status this workspace accepts: the built-in ones, then any
+    /// configured with `status.custom`.
+    pub fn statuses(&self) -> io::Result<Vec<String>> {
+        let statuses = parse_statuses(&self.run_json(&["statuses", "--json"])?);
+        if statuses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} statuses returned no statuses", self.name()),
+            ));
+        }
+        Ok(statuses)
     }
 
     /// `bd edit` opens `$EDITOR` itself, so the command inherits the terminal
@@ -542,6 +526,27 @@ impl Bd {
     }
 }
 
+/// Status names from `bd statuses --json`: `built_in_statuses` first, then
+/// `custom_statuses`, each a list of `{"name": ...}` objects or plain names.
+fn parse_statuses(value: &Value) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for key in ["built_in_statuses", "custom_statuses"] {
+        let Some(entries) = value.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for entry in entries {
+            let name = entry
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| entry.as_str());
+            if let Some(name) = name.filter(|name| !names.iter().any(|known| known == name)) {
+                names.push(name.to_string());
+            }
+        }
+    }
+    names
+}
+
 fn parse_issue_collection(value: Value) -> io::Result<Vec<Issue>> {
     let issues = match value {
         Value::Array(values) => values,
@@ -595,13 +600,47 @@ mod tests {
         }
     }
 
+    /// An issue nested under `parent` through a parent-child link.
+    fn child(id: &str, parent: &str) -> Issue {
+        let mut child = issue(id, &[parent]);
+        child.dependencies[0].dependency_type = PARENT_CHILD.to_string();
+        child
+    }
+
     #[test]
-    fn roots_are_issues_not_targeted_by_another_issue() {
+    fn roots_are_issues_without_a_listed_parent() {
         let graph = IssueGraph::new(
-            vec![issue("a", &["b"]), issue("b", &[]), issue("c", &[])],
+            vec![issue("a", &[]), child("b", "a"), issue("c", &[])],
             vec![],
         );
         assert_eq!(graph.roots(), &["a", "c"]);
+        assert_eq!(graph.tree_children("a"), &["b"]);
+    }
+
+    #[test]
+    fn blocks_and_other_links_stay_out_of_the_tree() {
+        let mut blocked = child("mac-29", "mac");
+        for (target, kind) in [("mac-28", "blocks"), ("note", "related")] {
+            blocked.dependencies.push(Dependency {
+                id: target.to_string(),
+                dependency_type: kind.to_string(),
+                ..Dependency::default()
+            });
+        }
+        let graph = IssueGraph::new(
+            vec![
+                issue("mac", &[]),
+                blocked,
+                child("mac-28", "mac"),
+                issue("note", &[]),
+            ],
+            vec![],
+        );
+
+        assert_eq!(graph.roots(), &["mac", "note"]);
+        assert_eq!(graph.tree_children("mac"), &["mac-29", "mac-28"]);
+        assert!(graph.tree_children("mac-29").is_empty());
+        assert_eq!(graph.issue("mac-29").unwrap().dependencies.len(), 3);
     }
 
     #[test]
@@ -617,7 +656,7 @@ mod tests {
 
     #[test]
     fn cycles_remain_visible() {
-        let graph = IssueGraph::new(vec![issue("a", &["b"]), issue("b", &["a"])], vec![]);
+        let graph = IssueGraph::new(vec![child("a", "b"), child("b", "a")], vec![]);
         assert_eq!(graph.roots(), &["a", "b"]);
     }
 
@@ -632,18 +671,6 @@ mod tests {
         assert!(!graph.is_listed("z"));
         assert_eq!(graph.len(), 1);
         assert_eq!(graph.roots(), &["a"]);
-    }
-
-    #[test]
-    fn with_issue_closed_moves_the_issue_into_context() {
-        let graph = IssueGraph::new(vec![issue("a", &["b"]), issue("b", &[])], vec![]);
-
-        let closed = graph.with_issue_closed("a");
-
-        assert_eq!(closed.roots(), &["b"]);
-        assert!(!closed.is_listed("a"));
-        assert!(closed.is_listed("b"));
-        assert_eq!(closed.issue("a").unwrap().status, "closed");
     }
 
     fn snapshot(id: &str, status: &str) -> Issue {
@@ -752,15 +779,17 @@ mod tests {
     }
 
     #[test]
-    fn replacing_issue_refreshes_its_description() {
-        let mut graph = IssueGraph::new(vec![issue("a", &[])], vec![]);
-        let mut refreshed = issue("a", &[]);
-        refreshed.description = "Edited description".to_string();
-
-        graph.replace_issue(refreshed);
-
-        assert_eq!(graph.issue("a").unwrap().description, "Edited description");
-        assert!(graph.is_listed("a"));
+    fn parses_built_in_then_custom_statuses() {
+        let value = serde_json::json!({
+            "built_in_statuses": [{"name": "open"}, {"name": "closed"}],
+            "custom_statuses": [{"name": "review"}, "needs_me", {"name": "open"}],
+            "schema_version": 1,
+        });
+        assert_eq!(
+            parse_statuses(&value),
+            ["open", "closed", "review", "needs_me"]
+        );
+        assert!(parse_statuses(&serde_json::json!({"schema_version": 1})).is_empty());
     }
 
     #[test]

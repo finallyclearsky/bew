@@ -1,104 +1,151 @@
+//! Drawing. Each frame is drawn into a ratatui buffer; ratatui compares it
+//! with the previous frame and writes only the cells that changed, so a
+//! redraw never flickers. Steps replace the whole screen.
+
 use crate::app::{
-    AddIssueFlow, AddIssueStep, App, Picker, PickerKind, Screen, DEFAULT_PRIORITY_INDEX,
+    AddIssueFlow, AddIssueStep, App, Choice, ChoiceKind, Screen, Step, DEFAULT_PRIORITY_INDEX,
     ISSUE_TYPES, PRIORITIES,
 };
-use crate::model::Issue;
-use crossterm::cursor::MoveTo;
-use crossterm::queue;
-use crossterm::style::{
-    Attribute, Color, Print, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor,
-};
-use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
-use std::io::{self, Write};
+use crate::model::{Issue, IssueGraph};
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::Frame;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SEPARATOR: &str = " │ ";
-const HIGHLIGHT_BACKGROUND: Color = Color::AnsiValue(238);
-const MODAL_BACKGROUND: Color = Color::AnsiValue(235);
+const HIGHLIGHT_BACKGROUND: Color = Color::Indexed(238);
+/// Marks an issue that has a live agent pane.
+const PANE_MARKER: &str = "● ";
+const PANE_COLOR: Color = Color::Cyan;
 
-#[derive(Clone, Copy)]
-enum LineStyle {
-    Plain,
-    Bold,
-    Dim,
-    Header,
-    Selected,
-    Dependency,
-}
-
-struct DetailLine {
+/// One line of text with a single style. `fill` paints the style across
+/// the whole width, for highlighted rows.
+struct Line {
     text: String,
-    style: LineStyle,
-    dependency: Option<usize>,
+    style: Style,
+    fill: bool,
 }
 
-/// Issue behind a table row, for cell colors; `None` renders the header.
-struct RowState<'a> {
-    selected: bool,
-    issue: &'a Issue,
-}
-
-pub fn draw(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-    queue!(out, BeginSynchronizedUpdate, MoveTo(0, 0))?;
-    match app.screen() {
-        Screen::Tree => draw_tree(app, out, width, height)?,
-        Screen::Detail => draw_detail(app, out, width, height)?,
-    }
-    if let Some(flow) = app.add_issue_flow() {
-        draw_add_issue(out, width, height, flow, app.status_message())?;
-        if flow.is_confirming_cancel() {
-            draw_add_issue_cancel_confirmation(out, width, height)?;
+impl Line {
+    fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+            fill: false,
         }
     }
-    if let Some(picker) = app.picker() {
-        draw_picker(out, width, height, picker)?;
+
+    fn plain(text: impl Into<String>) -> Self {
+        Self::new(text, Style::new())
     }
-    if let Some(issue_id) = app.closing_issue_id() {
-        draw_close_confirmation(out, width, height, issue_id)?;
+
+    fn blank() -> Self {
+        Self::plain("")
     }
-    queue!(out, EndSynchronizedUpdate)?;
-    out.flush()
+
+    fn filled(mut self) -> Self {
+        self.fill = true;
+        self
+    }
 }
 
-fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-    let width = width as usize;
-    if height == 0 || width == 0 {
-        return Ok(());
+pub fn draw(app: &mut App, frame: &mut Frame) {
+    let area = frame.area();
+    let buffer = frame.buffer_mut();
+    if area.width == 0 || area.height == 0 {
+        return;
     }
+    if let Some(step) = app.step().cloned() {
+        draw_step(app, &step, buffer, area);
+        return;
+    }
+    match app.screen() {
+        Screen::Tree => draw_tree(app, buffer, area),
+        Screen::Detail => draw_detail(app, buffer, area),
+    }
+}
 
+fn header_style() -> Style {
+    Style::new()
+        .bg(HIGHLIGHT_BACKGROUND)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn dim() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+fn bold() -> Style {
+    Style::new().add_modifier(Modifier::BOLD)
+}
+
+/// Writes `text` at (`x`, `y`), cut to `width` columns; returns the column
+/// after it.
+fn put(buffer: &mut Buffer, x: u16, y: u16, text: &str, width: usize, style: Style) -> u16 {
+    buffer.set_stringn(x, y, text, width, style).0
+}
+
+fn put_line(buffer: &mut Buffer, area: Rect, y: u16, line: &Line) {
+    if line.fill {
+        buffer.set_style(Rect::new(area.x, y, area.width, 1), line.style);
+    }
+    put(
+        buffer,
+        area.x,
+        y,
+        &truncate(&line.text, area.width as usize),
+        area.width as usize,
+        line.style,
+    );
+}
+
+/// The last row: the status message if there is one, otherwise the hints.
+fn draw_footer(buffer: &mut Buffer, area: Rect, status: Option<&str>, hints: &str, style: Style) {
+    let y = area.bottom() - 1;
+    let line = match status {
+        Some(status) => Line::new(
+            status,
+            Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        ),
+        None => Line::new(hints, style),
+    };
+    put_line(buffer, area, y, &line);
+}
+
+fn draw_tree(app: &mut App, buffer: &mut Buffer, area: Rect) {
+    let width = area.width as usize;
+    // The pane column is there whenever agent panes are possible, so the
+    // table does not shift when a pane opens or closes.
+    let gutter = if app.tmux() { PANE_MARKER.width() } else { 0 };
     let id_width = app
         .rows
         .iter()
         .map(|row| row.issue_id.width())
         .max()
         .unwrap_or(2);
-    let widths = table_widths(width, id_width);
+    let widths = table_widths(width.saturating_sub(gutter), id_width);
+    buffer.set_style(Rect::new(area.x, area.y, area.width, 1), header_style());
     write_table_row(
-        out,
-        0,
+        buffer,
+        area.x + gutter as u16,
+        area.y,
         &["ID", "PRIORITY", "STATUS", "TYPE", "NAME"],
         widths,
         None,
-    )?;
+    );
 
-    let list_height = height.saturating_sub(2) as usize;
+    let list_height = area.height.saturating_sub(2) as usize;
     app.viewport = list_height.max(1);
-    let mut content_end: u16 = 1;
     if app.rows.is_empty() {
         // Only a search can empty the rows; otherwise the create entry is there.
         let message = format!(
             "No issue IDs match /{}",
             app.search_query().unwrap_or_default()
         );
-        queue!(
-            out,
-            MoveTo(0, 1),
-            Clear(ClearType::CurrentLine),
-            SetAttribute(Attribute::Dim),
-            Print(truncate(&message, width)),
-            SetAttribute(Attribute::Reset)
-        )?;
-        content_end = 2;
+        if area.height > 2 {
+            put_line(buffer, area, area.y + 1, &Line::new(message, dim()));
+        }
     } else if list_height > 0 {
         if app.scroll + list_height > app.rows.len() {
             app.scroll = app.rows.len().saturating_sub(list_height);
@@ -113,19 +160,39 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
         let visible = list_height.min(app.rows.len().saturating_sub(app.scroll));
         for line in 0..visible {
             let position = app.scroll + line;
+            let y = area.y + line as u16 + 1;
+            let selected = position == app.cursor;
             let row = &app.rows[position];
+            if selected {
+                buffer.set_style(
+                    Rect::new(area.x, y, area.width, 1),
+                    Style::new().bg(HIGHLIGHT_BACKGROUND),
+                );
+            }
             if row.is_create_entry() {
-                draw_create_entry(out, line as u16 + 1, width, position == app.cursor)?;
+                put(
+                    buffer,
+                    area.x,
+                    y,
+                    "+ Create New",
+                    width,
+                    Style::new().fg(Color::Green).add_modifier(Modifier::BOLD),
+                );
                 continue;
             }
             let Some(issue) = app.graph.issue(&row.issue_id) else {
-                queue!(
-                    out,
-                    MoveTo(0, line as u16 + 1),
-                    Clear(ClearType::CurrentLine)
-                )?;
                 continue;
             };
+            if gutter > 0 && app.pane(&issue.id).is_some() {
+                put(
+                    buffer,
+                    area.x,
+                    y,
+                    PANE_MARKER,
+                    gutter,
+                    Style::new().fg(PANE_COLOR),
+                );
+            }
             let marker = if app.search_query().is_some() {
                 "  "
             } else if row.cycle {
@@ -143,74 +210,53 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
             let priority = format!("P{}", issue.priority);
             let issue_type = short_type(&issue.issue_type);
             write_table_row(
-                out,
-                line as u16 + 1,
+                buffer,
+                area.x + gutter as u16,
+                y,
                 &[&issue.id, &priority, &issue.status, &issue_type, &name],
                 widths,
-                Some(RowState {
-                    selected: position == app.cursor,
-                    issue,
-                }),
-            )?;
+                Some(issue),
+            );
         }
-        content_end = visible as u16 + 1;
-    }
-    queue!(
-        out,
-        MoveTo(0, content_end),
-        Clear(ClearType::FromCursorDown)
-    )?;
-
-    if let Some(status) = app.status_message() {
-        return draw_status_line(out, width, height, status);
     }
 
-    let footer = if let Some(query) = app.search_query() {
-        format!(
-            "/{query}  · {} match{} · ↑/↓ select · Enter open · Esc cancel",
-            app.rows.len(),
-            if app.rows.len() == 1 { "" } else { "es" }
+    let (hints, style) = if let Some(query) = app.search_query() {
+        (
+            format!(
+                "/{query}  · {} match{} · ↑/↓ select · Enter open · Esc cancel",
+                app.rows.len(),
+                if app.rows.len() == 1 { "" } else { "es" }
+            ),
+            bold(),
         )
     } else {
-        format!(
-            "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · e edit · s status · p priority · x close · q quit",
-            app.graph.len(),
-            if app.graph.len() == 1 { "" } else { "s" }
+        (
+            format!(
+                "{} issue{} · + add child · / go to · j/k move · h/l fold · Enter open · e edit · s status · p priority · x close{} · q quit",
+                app.graph.len(),
+                if app.graph.len() == 1 { "" } else { "s" },
+                if app.tmux() { " · a agent · f focus" } else { "" }
+            ),
+            dim(),
         )
     };
-    queue!(
-        out,
-        MoveTo(0, height - 1),
-        Clear(ClearType::CurrentLine),
-        SetAttribute(if app.search_query().is_some() {
-            Attribute::Bold
-        } else {
-            Attribute::Dim
-        }),
-        Print(truncate(&footer, width)),
-        SetAttribute(Attribute::Reset)
-    )?;
-    Ok(())
+    if area.height > 1 {
+        draw_footer(buffer, area, app.status_message(), &hints, style);
+    }
 }
 
-fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io::Result<()> {
-    let width = width as usize;
-    if height == 0 || width == 0 {
-        return Ok(());
-    }
+fn draw_detail(app: &mut App, buffer: &mut Buffer, area: Rect) {
+    let width = area.width as usize;
     let Some(issue) = app.current_detail_issue().cloned() else {
-        queue!(out, MoveTo(0, 0), Clear(ClearType::FromCursorDown))?;
-        return Ok(());
+        return;
     };
     let selected_dependency = app
         .detail_frame()
         .map(|frame| frame.dependency_cursor)
         .unwrap_or(0);
-    let lines = detail_lines(&issue, width, selected_dependency);
-    let visible = height.saturating_sub(1) as usize;
-    let selected_line = lines
-        .iter()
-        .position(|line| line.dependency == Some(selected_dependency));
+    let pane = app.tmux().then(|| app.pane(&issue.id).map(str::to_string));
+    let (lines, selected_line) = detail_lines(&app.graph, &issue, pane, width, selected_dependency);
+    let visible = area.height.saturating_sub(1) as usize;
     let max_scroll = lines.len().saturating_sub(visible);
     let mut scroll = app.detail_frame().map(|frame| frame.scroll).unwrap_or(0);
     scroll = scroll.min(max_scroll);
@@ -225,350 +271,76 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         frame.scroll = scroll;
     }
 
-    let mut content_end: u16 = 0;
     for (screen_line, line) in lines.iter().skip(scroll).take(visible).enumerate() {
-        queue!(
-            out,
-            MoveTo(0, screen_line as u16),
-            Clear(ClearType::UntilNewLine)
-        )?;
-        apply_line_style(out, line.style)?;
-        queue!(out, Print(truncate(&line.text, width)))?;
-        if matches!(line.style, LineStyle::Selected) {
-            let used = line.text.width().min(width);
-            if used < width {
-                queue!(out, Print(" ".repeat(width - used)))?;
-            }
-        }
-        queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-        content_end = screen_line as u16 + 1;
-    }
-    queue!(
-        out,
-        MoveTo(0, content_end),
-        Clear(ClearType::FromCursorDown)
-    )?;
-
-    if let Some(status) = app.status_message() {
-        return draw_status_line(out, width, height, status);
+        put_line(buffer, area, area.y + screen_line as u16, line);
     }
 
-    let footer = format!(
-        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority{} · Backspace back · Esc tree · q quit",
-        if app.can_close_current_issue() { " · x close" } else { "" }
+    let hints = format!(
+        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority{}{} · Backspace back · Esc tree · q quit",
+        if app.can_close_current_issue() { " · x close" } else { "" },
+        if app.tmux() { " · a agent · f focus" } else { "" }
     );
-    queue!(
-        out,
-        MoveTo(0, height - 1),
-        Clear(ClearType::CurrentLine),
-        SetAttribute(Attribute::Dim),
-        Print(truncate(&footer, width)),
-        SetAttribute(Attribute::Reset),
-    )?;
-    Ok(())
+    if area.height > 1 {
+        draw_footer(buffer, area, app.status_message(), &hints, dim());
+    }
 }
 
-fn draw_status_line(
-    out: &mut impl Write,
+/// The task view's lines, and the index of the selected dependency's line.
+/// `pane` is `None` outside tmux, where agent panes do not exist.
+fn detail_lines(
+    graph: &IssueGraph,
+    issue: &Issue,
+    pane: Option<Option<String>>,
     width: usize,
-    height: u16,
-    status: &str,
-) -> io::Result<()> {
-    queue!(
-        out,
-        MoveTo(0, height - 1),
-        Clear(ClearType::CurrentLine),
-        SetForegroundColor(Color::Yellow),
-        SetAttribute(Attribute::Bold),
-        Print(truncate(status, width)),
-        ResetColor,
-        SetAttribute(Attribute::Reset)
-    )
-}
-
-fn draw_create_entry(out: &mut impl Write, y: u16, width: usize, selected: bool) -> io::Result<()> {
-    queue!(out, MoveTo(0, y), Clear(ClearType::CurrentLine))?;
-    if selected {
-        queue!(out, SetBackgroundColor(HIGHLIGHT_BACKGROUND))?;
-    }
-    queue!(
-        out,
-        SetForegroundColor(Color::Green),
-        SetAttribute(Attribute::Bold),
-        Print(pad("+ Create New", width)),
-        ResetColor,
-        SetAttribute(Attribute::Reset)
-    )
-}
-
-fn draw_picker(out: &mut impl Write, width: u16, height: u16, picker: &Picker) -> io::Result<()> {
-    let title = match picker.kind {
-        PickerKind::Status => format!(" Set status · {} ", picker.issue_id),
-        PickerKind::Priority => format!(" Set priority · {} ", picker.issue_id),
-    };
-    let mut lines: Vec<String> = choice_lines(picker.options(), picker.index).collect();
-    lines.push(String::new());
-    lines.push("j/k or ↑/↓ select · Enter apply · Esc cancel".to_string());
-    draw_floating_modal(out, width, height, &title, &lines)
-}
-
-/// One line per option, with `›` marking the selected one.
-fn choice_lines<T: std::fmt::Display>(
-    options: impl IntoIterator<Item = T>,
-    selected: usize,
-) -> impl Iterator<Item = String> {
-    options.into_iter().enumerate().map(move |(index, option)| {
-        format!("{} {option}", if index == selected { "›" } else { " " })
-    })
-}
-
-fn draw_close_confirmation(
-    out: &mut impl Write,
-    width: u16,
-    height: u16,
-    issue_id: &str,
-) -> io::Result<()> {
-    draw_floating_modal(
-        out,
-        width,
-        height,
-        " Confirm close ",
-        &[
-            format!("Close issue {issue_id}?"),
-            String::new(),
-            "[y] Yes    [n/Esc] No".to_string(),
-        ],
-    )
-}
-
-fn draw_add_issue(
-    out: &mut impl Write,
-    width: u16,
-    height: u16,
-    flow: &AddIssueFlow,
-    status: Option<&str>,
-) -> io::Result<()> {
-    let parent = flow
-        .parent_id
-        .as_deref()
-        .unwrap_or("none · new top-level issue");
-    let mut lines = vec![format!("Parent: {parent}"), String::new()];
-    match flow.step {
-        AddIssueStep::Title => {
-            lines.push("Title".to_string());
-            lines.push(format!("> {}▏", flow.title));
-            lines.push(String::new());
-            lines.push("Type a title · Enter continue · e $EDITOR · Esc cancel".to_string());
-        }
-        AddIssueStep::Description => {
-            lines.push("Description".to_string());
-            let preview = flow.description.replace('\n', " ↵ ");
-            lines.push(format!("> {}▏", preview));
-            lines.push(String::new());
-            lines.push("Type a description · Enter continue · e $EDITOR · Esc cancel".to_string());
-        }
-        AddIssueStep::IssueType => {
-            lines.push("Select issue type".to_string());
-            lines.extend(choice_lines(ISSUE_TYPES, flow.issue_type_index));
-            lines.push(
-                "j/k or ↑/↓ select · Enter continue · Backspace previous · Esc cancel".to_string(),
-            );
-        }
-        AddIssueStep::Priority => {
-            lines.push("Select priority (P1 is the default)".to_string());
-            let priorities = PRIORITIES.iter().enumerate().map(|(index, priority)| {
-                let default = if index == DEFAULT_PRIORITY_INDEX {
-                    "  default"
-                } else {
-                    ""
-                };
-                format!("P{priority}{default}")
-            });
-            lines.extend(choice_lines(priorities, flow.priority_index));
-            lines.push(
-                "j/k or ↑/↓ select · Enter create · Backspace previous · Esc cancel".to_string(),
-            );
-        }
-    }
-    if let Some(status) = status {
-        lines.push(String::new());
-        lines.push(format!("Error: {status}"));
-    }
-    let title = if flow.parent_id.is_some() {
-        format!(" Add child issue · {}/4 ", flow.step.number())
-    } else {
-        format!(" Add issue · {}/4 ", flow.step.number())
-    };
-    draw_floating_modal(out, width, height, &title, &lines)
-}
-
-fn draw_add_issue_cancel_confirmation(
-    out: &mut impl Write,
-    width: u16,
-    height: u16,
-) -> io::Result<()> {
-    draw_floating_modal(
-        out,
-        width,
-        height,
-        " Discard new issue? ",
-        &[
-            "The issue has not been created.".to_string(),
-            String::new(),
-            "[y] Discard    [n/Esc] Keep editing".to_string(),
-        ],
-    )
-}
-
-fn draw_floating_modal(
-    out: &mut impl Write,
-    width: u16,
-    height: u16,
-    title: &str,
-    lines: &[String],
-) -> io::Result<()> {
-    if width == 0 || height == 0 {
-        return Ok(());
-    }
-    if width < 4 || height < 3 {
-        let fallback = lines.first().map(String::as_str).unwrap_or(title);
-        return queue!(
-            out,
-            MoveTo(0, height - 1),
-            SetAttribute(Attribute::Bold),
-            Print(truncate(fallback, width as usize)),
-            SetAttribute(Attribute::Reset)
-        );
-    }
-
-    let visible_lines = lines.len().min(height.saturating_sub(2) as usize);
-    let desired_width = lines
-        .iter()
-        .take(visible_lines)
-        .map(|line| line.width())
-        .max()
-        .unwrap_or(0)
-        .max(title.width())
-        .saturating_add(4);
-    let modal_width = desired_width.min(width as usize).max(4);
-    let modal_height = visible_lines + 2;
-    let left = (width as usize - modal_width) / 2;
-    let top = (height as usize - modal_height) / 2;
-    let inner_width = modal_width - 2;
-    let top_border = if title.width() <= inner_width {
-        format!(
-            "╭{title}{}╮",
-            "─".repeat(inner_width.saturating_sub(title.width()))
-        )
-    } else {
-        format!("╭{}╮", "─".repeat(inner_width))
-    };
-    draw_modal_line(out, left, top, &top_border, modal_width, true)?;
-    for (index, line) in lines.iter().take(visible_lines).enumerate() {
-        let content_width = inner_width.saturating_sub(2);
-        let content = truncate(line, content_width);
-        let body = format!(
-            "│ {}{} │",
-            content,
-            " ".repeat(content_width.saturating_sub(content.width()))
-        );
-        draw_modal_line(out, left, top + index + 1, &body, modal_width, false)?;
-    }
-    let bottom_border = format!("╰{}╯", "─".repeat(inner_width));
-    draw_modal_line(
-        out,
-        left,
-        top + modal_height - 1,
-        &bottom_border,
-        modal_width,
-        true,
-    )
-}
-
-fn draw_modal_line(
-    out: &mut impl Write,
-    x: usize,
-    y: usize,
-    line: &str,
-    width: usize,
-    border: bool,
-) -> io::Result<()> {
-    queue!(
-        out,
-        MoveTo(x as u16, y as u16),
-        SetBackgroundColor(MODAL_BACKGROUND),
-        SetForegroundColor(if border { Color::Cyan } else { Color::White }),
-        SetAttribute(if border {
-            Attribute::Bold
-        } else {
-            Attribute::NormalIntensity
-        }),
-        Print(pad(line, width)),
-        ResetColor,
-        SetAttribute(Attribute::Reset)
-    )?;
-    Ok(())
-}
-
-fn detail_lines(issue: &Issue, width: usize, selected_dependency: usize) -> Vec<DetailLine> {
-    let mut lines = Vec::new();
-    let heading = format!(
-        "{}  [P{}]  {}  {}",
-        issue.id,
-        issue.priority,
-        issue.status,
-        short_type(&issue.issue_type)
+    selected_dependency: usize,
+) -> (Vec<Line>, Option<usize>) {
+    let mut lines = vec![
+        Line::new(
+            format!(
+                "{}  [P{}]  {}  {}",
+                issue.id,
+                issue.priority,
+                issue.status,
+                short_type(&issue.issue_type)
+            ),
+            Style::new().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Line::blank(),
+    ];
+    lines.extend(
+        wrap(&issue.title, width)
+            .into_iter()
+            .map(|text| Line::new(text, bold())),
     );
-    lines.push(DetailLine {
-        text: heading,
-        style: LineStyle::Header,
-        dependency: None,
-    });
-    lines.push(blank());
-
-    for line in wrap(&issue.title, width) {
-        lines.push(DetailLine {
-            text: line,
-            style: LineStyle::Bold,
-            dependency: None,
-        });
-    }
 
     if !issue.description.trim().is_empty() {
-        lines.push(blank());
-        for line in wrap(&issue.description, width) {
-            lines.push(DetailLine {
-                text: line,
-                style: LineStyle::Plain,
-                dependency: None,
-            });
-        }
+        lines.push(Line::blank());
+        lines.extend(wrap(&issue.description, width).into_iter().map(Line::plain));
     }
 
-    lines.push(blank());
-    lines.push(DetailLine {
-        text: format!("Created:  {}", display_timestamp(&issue.created_at)),
-        style: LineStyle::Dim,
-        dependency: None,
-    });
-    lines.push(DetailLine {
-        text: format!("Updated:  {}", display_timestamp(&issue.updated_at)),
-        style: LineStyle::Dim,
-        dependency: None,
-    });
-    lines.push(blank());
-    lines.push(DetailLine {
-        text: "Dependencies:".to_string(),
-        style: LineStyle::Bold,
-        dependency: None,
-    });
+    lines.push(Line::blank());
+    lines.push(Line::new(
+        format!("Created:  {}", display_timestamp(&issue.created_at)),
+        dim(),
+    ));
+    lines.push(Line::new(
+        format!("Updated:  {}", display_timestamp(&issue.updated_at)),
+        dim(),
+    ));
+    match pane {
+        Some(Some(pane_id)) => lines.push(Line::new(
+            format!("Agent:    {PANE_MARKER}pane {pane_id} · f focus"),
+            Style::new().fg(PANE_COLOR),
+        )),
+        Some(None) => lines.push(Line::new("Agent:    no pane · a start", dim())),
+        None => {}
+    }
+    lines.push(Line::blank());
+    lines.push(Line::new("Dependencies:", bold()));
 
+    let mut selected_line = None;
     if issue.dependencies.is_empty() {
-        lines.push(DetailLine {
-            text: "  none".to_string(),
-            style: LineStyle::Dim,
-            dependency: None,
-        });
+        lines.push(Line::new("  none", dim()));
     } else {
         for (index, dependency) in issue.dependencies.iter().enumerate() {
             let dep_type = if dependency.dependency_type.is_empty() {
@@ -576,120 +348,264 @@ fn detail_lines(issue: &Issue, width: usize, selected_dependency: usize) -> Vec<
             } else {
                 format!(" ({})", dependency.dependency_type)
             };
-            lines.push(DetailLine {
-                text: format!(
-                    "  → {} [{}] {}{}",
-                    dependency.id, dependency.status, dependency.title, dep_type
-                ),
-                style: if index == selected_dependency {
-                    LineStyle::Selected
-                } else {
-                    LineStyle::Dependency
-                },
-                dependency: Some(index),
-            });
+            // `bd list` gives bare edges, so the title and status come from
+            // the linked issue itself.
+            let (status, title) = match graph.issue(&dependency.id) {
+                Some(target) => (&target.status, &target.title),
+                None => (&dependency.status, &dependency.title),
+            };
+            let text = format!("  → {} [{status}] {title}{dep_type}", dependency.id);
+            let line = Line::new(text, Style::new().fg(Color::Cyan));
+            if index == selected_dependency {
+                selected_line = Some(lines.len());
+                lines.push(
+                    Line {
+                        style: line.style.bg(HIGHLIGHT_BACKGROUND),
+                        ..line
+                    }
+                    .filled(),
+                );
+            } else {
+                lines.push(line);
+            }
         }
     }
-    lines
+    (lines, selected_line)
 }
 
-fn blank() -> DetailLine {
-    DetailLine {
-        text: String::new(),
-        style: LineStyle::Plain,
-        dependency: None,
+fn draw_step(app: &App, step: &Step, buffer: &mut Buffer, area: Rect) {
+    let (title, lines, hints) = match step {
+        Step::Choose(choice) => choice_step(app, choice),
+        Step::Close { issue_id } => (
+            format!("Close issue · {issue_id}"),
+            vec![
+                issue_title_line(app, issue_id),
+                Line::blank(),
+                Line::plain(format!("Close {issue_id}?")),
+                Line::blank(),
+                Line::new("[y] Yes    [n/Esc] No", bold()),
+            ],
+            "y close · n/Esc cancel".to_string(),
+        ),
+        Step::AddIssue(flow) => add_issue_step(flow, area.width as usize),
+        Step::Command { issue_id, input } => {
+            let mut lines = vec![
+                issue_title_line(app, issue_id),
+                Line::blank(),
+                Line::plain(format!(
+                    "Command to run in a new tmux pane next to bew. The pane is bound to {issue_id}."
+                )),
+                Line::new("bew does not change the issue; the command does what it needs.", dim()),
+                Line::blank(),
+            ];
+            lines.extend(
+                hard_wrap(&format!("> {input}▏"), area.width as usize)
+                    .into_iter()
+                    .map(|text| Line::new(text, bold())),
+            );
+            (
+                format!("Start agent · {issue_id}"),
+                lines,
+                "Type or paste a command · Enter run · Ctrl-U clear · Esc cancel".to_string(),
+            )
+        }
+    };
+
+    put_line(
+        buffer,
+        area,
+        area.y,
+        &Line::new(format!(" {title}"), header_style()).filled(),
+    );
+    let body_height = area.height.saturating_sub(3) as usize;
+    for (index, line) in lines.iter().take(body_height).enumerate() {
+        put_line(buffer, area, area.y + 2 + index as u16, line);
+    }
+    if area.height > 1 {
+        draw_footer(buffer, area, app.status_message(), &hints, dim());
     }
 }
 
-fn apply_line_style(out: &mut impl Write, style: LineStyle) -> io::Result<()> {
-    match style {
-        LineStyle::Plain => {}
-        LineStyle::Bold => queue!(out, SetAttribute(Attribute::Bold))?,
-        LineStyle::Dim => queue!(out, SetAttribute(Attribute::Dim))?,
-        LineStyle::Header => queue!(
-            out,
-            SetForegroundColor(Color::Cyan),
-            SetAttribute(Attribute::Bold)
-        )?,
-        LineStyle::Selected => queue!(
-            out,
-            SetForegroundColor(Color::Cyan),
-            SetBackgroundColor(HIGHLIGHT_BACKGROUND)
-        )?,
-        LineStyle::Dependency => queue!(out, SetForegroundColor(Color::Cyan))?,
-    }
-    Ok(())
+fn issue_title_line(app: &App, issue_id: &str) -> Line {
+    let title = app
+        .graph
+        .issue(issue_id)
+        .map(|issue| issue.title.as_str())
+        .unwrap_or_default();
+    Line::new(title, bold())
 }
 
+fn choice_step(app: &App, choice: &Choice) -> (String, Vec<Line>, String) {
+    let issue = app.graph.issue(&choice.issue_id);
+    let (title, current) = match choice.kind {
+        ChoiceKind::Status => (
+            "Set status",
+            issue.map(|issue| issue.status.clone()).unwrap_or_default(),
+        ),
+        ChoiceKind::Priority => (
+            "Set priority",
+            issue
+                .map(|issue| format!("P{}", issue.priority))
+                .unwrap_or_default(),
+        ),
+    };
+    let mut lines = vec![
+        issue_title_line(app, &choice.issue_id),
+        Line::new(format!("Now: {current}"), dim()),
+        Line::blank(),
+    ];
+    for (index, option) in choice.options.iter().enumerate() {
+        let color = match choice.kind {
+            ChoiceKind::Status => status_color(option),
+            ChoiceKind::Priority => priority_color(PRIORITIES.get(index).copied().unwrap_or(4)),
+        };
+        lines.push(option_line(option, index == choice.index, color));
+    }
+    (
+        format!("{title} · {}", choice.issue_id),
+        lines,
+        "j/k or ↑/↓ select · Enter apply · Esc cancel".to_string(),
+    )
+}
+
+/// One option of a list; `›` and the highlight mark the selected one.
+fn option_line(option: &str, selected: bool, color: Color) -> Line {
+    let text = format!("{} {option}", if selected { "›" } else { " " });
+    if selected {
+        Line::new(text, Style::new().fg(color).bg(HIGHLIGHT_BACKGROUND)).filled()
+    } else {
+        Line::new(text, Style::new().fg(color))
+    }
+}
+
+fn add_issue_step(flow: &AddIssueFlow, width: usize) -> (String, Vec<Line>, String) {
+    let title = if flow.parent_id.is_some() {
+        format!("Add child issue · {}/4", flow.step.number())
+    } else {
+        format!("Add issue · {}/4", flow.step.number())
+    };
+    if flow.is_confirming_cancel() {
+        return (
+            title,
+            vec![
+                Line::new("Discard new issue?", bold()),
+                Line::blank(),
+                Line::plain("The issue has not been created."),
+                Line::blank(),
+                Line::new("[y] Discard    [n/Esc] Keep editing", bold()),
+            ],
+            "y discard · n/Esc keep editing".to_string(),
+        );
+    }
+
+    let parent = flow
+        .parent_id
+        .as_deref()
+        .unwrap_or("none · new top-level issue");
+    let mut lines = vec![Line::new(format!("Parent: {parent}"), dim()), Line::blank()];
+    let hints = match flow.step {
+        AddIssueStep::Title => {
+            lines.push(Line::new("Title", bold()));
+            lines.extend(
+                hard_wrap(&format!("> {}▏", flow.title), width)
+                    .into_iter()
+                    .map(Line::plain),
+            );
+            "Type or paste a title · Enter continue · e $EDITOR (empty title) · Esc cancel"
+        }
+        AddIssueStep::Description => {
+            lines.push(Line::new(format!("Title: {}", flow.title), dim()));
+            lines.push(Line::blank());
+            lines.push(Line::new("Description", bold()));
+            let text = format!("{}▏", flow.description);
+            for (index, paragraph) in text.split('\n').enumerate() {
+                let prefix = if index == 0 { "> " } else { "  " };
+                lines.extend(
+                    hard_wrap(&format!("{prefix}{paragraph}"), width)
+                        .into_iter()
+                        .map(Line::plain),
+                );
+            }
+            "Type or paste a description · Enter continue · e $EDITOR (empty description) · Esc cancel"
+        }
+        AddIssueStep::IssueType => {
+            lines.push(Line::new(format!("Title: {}", flow.title), dim()));
+            lines.push(Line::blank());
+            lines.push(Line::new("Issue type", bold()));
+            for (index, issue_type) in ISSUE_TYPES.iter().enumerate() {
+                lines.push(option_line(
+                    issue_type,
+                    index == flow.issue_type_index,
+                    type_color(issue_type),
+                ));
+            }
+            "j/k or ↑/↓ select · Enter continue · Backspace previous · Esc cancel"
+        }
+        AddIssueStep::Priority => {
+            lines.push(Line::new(
+                format!("Title: {} · {}", flow.title, flow.issue_type()),
+                dim(),
+            ));
+            lines.push(Line::blank());
+            lines.push(Line::new("Priority", bold()));
+            for (index, priority) in PRIORITIES.iter().enumerate() {
+                let default = if index == DEFAULT_PRIORITY_INDEX {
+                    "  default"
+                } else {
+                    ""
+                };
+                lines.push(option_line(
+                    &format!("P{priority}{default}"),
+                    index == flow.priority_index,
+                    priority_color(*priority),
+                ));
+            }
+            "j/k or ↑/↓ select · Enter create · Backspace previous · Esc cancel"
+        }
+    };
+    (title, lines, hints.to_string())
+}
+
+/// Writes the five table cells from `x`. `issue` gives the cell colors;
+/// `None` writes the header.
 fn write_table_row(
-    out: &mut impl Write,
+    buffer: &mut Buffer,
+    mut x: u16,
     y: u16,
     cells: &[&str; 5],
     widths: [usize; 5],
-    state: Option<RowState>,
-) -> io::Result<()> {
-    queue!(
-        out,
-        MoveTo(0, y),
-        Clear(ClearType::CurrentLine),
-        ResetColor,
-        SetAttribute(Attribute::Reset)
-    )?;
-    let header = state.is_none();
-    let selected = state.as_ref().is_some_and(|state| state.selected);
-    let highlighted = header || selected;
-    if highlighted {
-        queue!(out, SetBackgroundColor(HIGHLIGHT_BACKGROUND))?;
-    }
-    if header {
-        queue!(out, SetAttribute(Attribute::Bold))?;
-    }
-
+    issue: Option<&Issue>,
+) {
+    let header = issue.is_none();
     for index in 0..5 {
-        if let Some(state) = &state {
+        let mut style = if header { bold() } else { Style::new() };
+        if let Some(issue) = issue {
             match index {
-                1 => queue!(
-                    out,
-                    SetForegroundColor(priority_color(state.issue.priority))
-                )?,
-                2 => queue!(out, SetForegroundColor(status_color(&state.issue.status)))?,
-                3 => queue!(out, SetForegroundColor(type_color(&state.issue.issue_type)))?,
+                1 => style = style.fg(priority_color(issue.priority)),
+                2 => style = style.fg(status_color(&issue.status)),
+                3 => style = style.fg(type_color(&issue.issue_type)),
                 _ => {}
             }
         }
-        queue!(out, Print(pad(cells[index], widths[index])))?;
-        if !header {
-            if selected {
-                queue!(out, SetForegroundColor(Color::Reset))?;
-            } else {
-                queue!(out, ResetColor)?;
-            }
-        }
+        x = put(
+            buffer,
+            x,
+            y,
+            &pad(cells[index], widths[index]),
+            widths[index],
+            style,
+        );
         if index < 4 {
-            write_separator(out, highlighted)?;
-            if header {
-                queue!(out, SetAttribute(Attribute::Bold))?;
-            }
+            x = put(
+                buffer,
+                x,
+                y,
+                SEPARATOR,
+                SEPARATOR.width(),
+                Style::new().fg(Color::DarkGray).add_modifier(Modifier::DIM),
+            );
         }
     }
-    queue!(out, ResetColor, SetAttribute(Attribute::Reset))?;
-    Ok(())
-}
-
-fn write_separator(out: &mut impl Write, highlighted: bool) -> io::Result<()> {
-    queue!(
-        out,
-        SetForegroundColor(Color::DarkGrey),
-        SetAttribute(Attribute::Dim),
-        Print(SEPARATOR),
-        SetAttribute(Attribute::NormalIntensity),
-    )?;
-    if highlighted {
-        queue!(out, SetForegroundColor(Color::Reset))?;
-    } else {
-        queue!(out, ResetColor)?;
-    }
-    Ok(())
 }
 
 fn table_widths(width: usize, id_hint: usize) -> [usize; 5] {
@@ -728,7 +644,7 @@ fn priority_color(priority: i32) -> Color {
         1 => Color::Yellow,
         2 => Color::Green,
         3 => Color::Blue,
-        _ => Color::DarkGrey,
+        _ => Color::DarkGray,
     }
 }
 
@@ -737,7 +653,7 @@ fn status_color(status: &str) -> Color {
         "open" => Color::Green,
         "in_progress" | "in-progress" => Color::Yellow,
         "blocked" => Color::Red,
-        "closed" => Color::DarkGrey,
+        "closed" => Color::DarkGray,
         "deferred" => Color::Blue,
         _ => Color::White,
     }
@@ -751,7 +667,7 @@ fn type_color(issue_type: &str) -> Color {
         "task" => Color::Blue,
         "chore" => Color::Yellow,
         "merge-request" => Color::Green,
-        _ => Color::DarkGrey,
+        _ => Color::DarkGray,
     }
 }
 
@@ -807,6 +723,28 @@ pub fn truncate(value: &str, width: usize) -> String {
     output
 }
 
+/// Breaks `value` into lines of at most `width` columns at any character,
+/// keeping every space, for text the user is typing.
+fn hard_wrap(value: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = vec![String::new()];
+    let mut used = 0;
+    for character in value.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used + character_width > width {
+            lines.push(String::new());
+            used = 0;
+        }
+        lines
+            .last_mut()
+            .expect("lines is never empty")
+            .push(character);
+        used += character_width;
+    }
+    lines
+}
+
+/// Breaks `value` into lines of at most `width` columns at word boundaries.
 fn wrap(value: &str, width: usize) -> Vec<String> {
     if value.is_empty() {
         return vec![String::new()];
@@ -868,59 +806,12 @@ mod tests {
     use super::*;
     use crate::model::{Issue, IssueGraph};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::collections::HashMap;
 
-    #[test]
-    fn close_confirmation_renders_as_a_floating_bordered_modal() {
-        let mut app = App::new(IssueGraph::new(
-            vec![Issue {
-                id: "task-1".into(),
-                title: "A task".into(),
-                ..Issue::default()
-            }],
-            vec![],
-        ));
-        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE));
-
-        let mut output = Vec::new();
-        draw(&mut app, &mut output, 80, 20).unwrap();
-        let rendered = String::from_utf8_lossy(&output);
-
-        assert!(rendered.contains("╭ Confirm close "));
-        assert!(rendered.contains("Close issue task-1?"));
-        assert!(rendered.contains("[y] Yes    [n/Esc] No"));
-        assert!(rendered.contains('╰'));
-    }
-
-    #[test]
-    fn add_issue_flow_and_discard_confirmation_render_as_modals() {
-        let mut app = App::new(IssueGraph::new(
-            vec![Issue {
-                id: "task-1".into(),
-                title: "A task".into(),
-                ..Issue::default()
-            }],
-            vec![],
-        ));
-        app.handle_key(KeyEvent::new(KeyCode::Char('+'), KeyModifiers::NONE));
-
-        let mut output = Vec::new();
-        draw(&mut app, &mut output, 90, 24).unwrap();
-        let rendered = String::from_utf8_lossy(&output);
-        assert!(rendered.contains("Add child issue · 1/4"));
-        assert!(rendered.contains("Parent: task-1"));
-        assert!(rendered.contains("e $EDITOR"));
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        output.clear();
-        draw(&mut app, &mut output, 90, 24).unwrap();
-        let rendered = String::from_utf8_lossy(&output);
-        assert!(rendered.contains("Discard new issue?"));
-        assert!(rendered.contains("[y] Discard"));
-    }
-
-    #[test]
-    fn tree_renders_the_create_entry_and_status_picker() {
-        let mut app = App::new(IssueGraph::new(
+    fn app() -> App {
+        App::new(IssueGraph::new(
             vec![Issue {
                 id: "task-1".into(),
                 title: "A task".into(),
@@ -928,40 +819,182 @@ mod tests {
                 ..Issue::default()
             }],
             vec![],
-        ));
+        ))
+    }
 
-        let mut output = Vec::new();
-        draw(&mut app, &mut output, 80, 20).unwrap();
-        let rendered = String::from_utf8_lossy(&output).to_string();
-        assert!(rendered.contains("+ Create New"));
+    fn press(app: &mut App, code: KeyCode) {
+        app.handle_key(KeyEvent::new(code, KeyModifiers::NONE));
+    }
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
-        output.clear();
-        draw(&mut app, &mut output, 80, 24).unwrap();
-        let rendered = String::from_utf8_lossy(&output);
-        assert!(rendered.contains("Set status · task-1"));
-        assert!(rendered.contains("› open"));
-        assert!(rendered.contains("Enter apply"));
+    /// Draws `app` and returns the screen buffer.
+    fn render_buffer(app: &mut App, width: u16, height: u16) -> Buffer {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(app, frame)).unwrap();
+        terminal.backend().buffer().clone()
+    }
+
+    /// Draws `app` and returns the screen as text, one line per row.
+    fn render(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = render_buffer(app, width, height);
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn close_confirmation_replaces_the_screen() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('x'));
+
+        let screen = render(&mut app, 80, 20);
+        assert!(screen.starts_with(" Close issue · task-1"));
+        assert!(screen.contains("Close task-1?"));
+        assert!(screen.contains("[y] Yes    [n/Esc] No"));
+        assert!(
+            !screen.contains("PRIORITY"),
+            "the tree is not drawn behind it"
+        );
+    }
+
+    #[test]
+    fn add_issue_and_discard_confirmation_are_full_screen_steps() {
+        let mut app = app();
+        press(&mut app, KeyCode::Char('+'));
+
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.starts_with(" Add child issue · 1/4"));
+        assert!(screen.contains("Parent: task-1"));
+        assert!(screen.contains("e $EDITOR"));
+
+        press(&mut app, KeyCode::Esc);
+        let screen = render(&mut app, 100, 24);
+        assert!(screen.contains("Discard new issue?"));
+        assert!(screen.contains("[y] Discard"));
+    }
+
+    #[test]
+    fn tree_renders_the_create_entry_and_the_status_step() {
+        let mut app = app();
+        assert!(render(&mut app, 80, 20).contains("+ Create New"));
+
+        press(&mut app, KeyCode::Char('s'));
+        let screen = render(&mut app, 80, 24);
+        assert!(screen.starts_with(" Set status · task-1"));
+        assert!(screen.contains("› open"));
+        assert!(screen.contains("  in_progress"));
+        assert!(screen.contains("Enter apply"));
+    }
+
+    #[test]
+    fn command_step_shows_the_typed_command() {
+        let mut app = app();
+        app.set_tmux(true);
+        press(&mut app, KeyCode::Char('a'));
+        app.handle_paste("claude \"/ship task-1\"");
+
+        let screen = render(&mut app, 80, 20);
+        assert!(screen.starts_with(" Start agent · task-1"));
+        assert!(screen.contains("> claude \"/ship task-1\"▏"));
+    }
+
+    #[test]
+    fn a_live_pane_shows_in_the_tree_and_the_task_view() {
+        let mut app = app();
+        app.set_tmux(true);
+        let screen = render(&mut app, 200, 10);
+        assert!(!screen.contains('●'));
+        assert!(screen.contains("a agent · f focus"));
+
+        app.set_panes(HashMap::from([("task-1".to_string(), "%9".to_string())]));
+        let screen = render(&mut app, 80, 10);
+        assert!(screen.lines().nth(2).unwrap().starts_with("● task-1"));
+
+        press(&mut app, KeyCode::Enter);
+        assert!(render(&mut app, 80, 20).contains("pane %9 · f focus"));
+    }
+
+    #[test]
+    fn task_view_shows_each_link_with_the_linked_issue_title_and_status() {
+        // `bd list` edges carry only the target ID and the link type.
+        let edge = |id: &str, kind: &str| crate::model::Dependency {
+            id: id.into(),
+            dependency_type: kind.into(),
+            ..Default::default()
+        };
+        let blocked = Issue {
+            id: "b".into(),
+            title: "Menu bar".into(),
+            dependencies: vec![edge("a", "blocks"), edge("gone", "related")],
+            ..Issue::default()
+        };
+        let blocker = Issue {
+            id: "a".into(),
+            title: "Window chrome".into(),
+            status: "in_progress".into(),
+            ..Issue::default()
+        };
+        let mut app = App::new(IssueGraph::new(vec![blocked, blocker], vec![]));
+        press(&mut app, KeyCode::Enter);
+
+        let screen = render(&mut app, 80, 20);
+        assert!(screen.contains("→ a [in_progress] Window chrome (blocks)"));
+        assert!(screen.contains("→ gone [?] (not found) (related)"));
+    }
+
+    #[test]
+    fn outside_tmux_there_is_no_pane_column_or_agent_hint() {
+        let mut app = app();
+        let screen = render(&mut app, 120, 10);
+        assert!(screen.lines().nth(2).unwrap().starts_with("task-1"));
+        assert!(!screen.contains("a agent"));
     }
 
     #[test]
     fn status_message_replaces_the_footer_hints() {
-        let mut app = App::new(IssueGraph::new(
+        let mut app = app();
+        app.set_status("bd close failed: boom".to_string());
+
+        let screen = render(&mut app, 80, 20);
+        assert!(screen.contains("bd close failed: boom"));
+        assert!(!screen.contains("q quit"));
+    }
+
+    #[test]
+    fn highlights_use_a_background_and_keep_label_colors() {
+        let mut issue_app = App::new(IssueGraph::new(
             vec![Issue {
-                id: "task-1".into(),
-                title: "A task".into(),
+                id: "issue-1".into(),
+                priority: 0,
+                status: "open".into(),
+                issue_type: "feature".into(),
                 ..Issue::default()
             }],
             vec![],
         ));
-        app.set_status("bd close failed: boom".to_string());
+        let buffer = render_buffer(&mut issue_app, 80, 5);
+        let header = &buffer[(0, 0)];
+        assert_eq!(header.bg, HIGHLIGHT_BACKGROUND);
+        assert!(header.modifier.contains(Modifier::BOLD));
 
-        let mut output = Vec::new();
-        draw(&mut app, &mut output, 80, 20).unwrap();
-        let rendered = String::from_utf8_lossy(&output);
-
-        assert!(rendered.contains("bd close failed: boom"));
-        assert!(!rendered.contains("q quit"));
+        // Row 2 is the selected issue: ID, then priority after one separator.
+        let id = &buffer[(0, 2)];
+        assert_eq!(id.bg, HIGHLIGHT_BACKGROUND);
+        assert!(!id.modifier.contains(Modifier::REVERSED));
+        let priority_x = (8 + SEPARATOR.width()) as u16;
+        assert_eq!(buffer[(priority_x, 2)].fg, priority_color(0));
+        assert_eq!(buffer[(priority_x, 2)].bg, HIGHLIGHT_BACKGROUND);
+        assert_eq!(
+            buffer[(79, 2)].bg,
+            HIGHLIGHT_BACKGROUND,
+            "the highlight fills the row"
+        );
     }
 
     #[test]
@@ -980,56 +1013,6 @@ mod tests {
     }
 
     #[test]
-    fn table_highlights_use_a_background_without_reversing_label_colors() {
-        let mut background = Vec::new();
-        queue!(background, SetBackgroundColor(HIGHLIGHT_BACKGROUND)).unwrap();
-        let mut reverse = Vec::new();
-        queue!(reverse, SetAttribute(Attribute::Reverse)).unwrap();
-        let mut priority = Vec::new();
-        queue!(priority, SetForegroundColor(priority_color(0))).unwrap();
-        let mut status = Vec::new();
-        queue!(status, SetForegroundColor(status_color("open"))).unwrap();
-        let mut issue_type = Vec::new();
-        queue!(issue_type, SetForegroundColor(type_color("feature"))).unwrap();
-
-        let issue = Issue {
-            priority: 0,
-            status: "open".into(),
-            issue_type: "feature".into(),
-            ..Issue::default()
-        };
-        let mut selected = Vec::new();
-        write_table_row(
-            &mut selected,
-            1,
-            &["issue-1", "P0", "open", "feat", "Example"],
-            [8, 8, 8, 4, 12],
-            Some(RowState {
-                selected: true,
-                issue: &issue,
-            }),
-        )
-        .unwrap();
-        let mut header = Vec::new();
-        write_table_row(
-            &mut header,
-            0,
-            &["ID", "PRIORITY", "STATUS", "TYPE", "NAME"],
-            [8, 8, 8, 4, 12],
-            None,
-        )
-        .unwrap();
-
-        assert!(contains_bytes(&selected, &background));
-        assert!(contains_bytes(&selected, &priority));
-        assert!(contains_bytes(&selected, &status));
-        assert!(contains_bytes(&selected, &issue_type));
-        assert!(!contains_bytes(&selected, &reverse));
-        assert!(contains_bytes(&header, &background));
-        assert!(!contains_bytes(&header, &reverse));
-    }
-
-    #[test]
     fn truncation_respects_unicode_width() {
         assert_eq!(truncate("abcdef", 4), "abc…");
         assert_eq!(truncate("界界界", 5), "界界…");
@@ -1038,11 +1021,20 @@ mod tests {
     #[test]
     fn wraps_description_to_terminal_width() {
         assert_eq!(wrap("one two three", 7), vec!["one two", "three"]);
+        assert_eq!(hard_wrap("ab  cd", 3), vec!["ab ", " cd"]);
     }
 
-    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
+    #[test]
+    fn tiny_terminals_do_not_panic() {
+        let mut app = app();
+        for (width, height) in [(1, 1), (3, 2), (10, 3)] {
+            render(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            render(&mut app, width, height);
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, KeyCode::Char('s'));
+            render(&mut app, width, height);
+            press(&mut app, KeyCode::Esc);
+        }
     }
 }

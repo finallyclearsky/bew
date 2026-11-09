@@ -1,11 +1,20 @@
-use beads_explorer::app::{Action, App};
-use beads_explorer::live::LiveUpdates;
-use beads_explorer::model::{Bd, IssueGraph};
-use beads_explorer::ui;
+use bew::app::{Action, App};
+use bew::live::LiveUpdates;
+use bew::model::{Bd, IssueGraph};
+use bew::{tmux, ui};
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{self, Event, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{self, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::event::{
+    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    Event, KeyCode, KeyEventKind, KeyModifiers,
+};
+use crossterm::terminal::{
+    self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen,
+    LeaveAlternateScreen,
+};
+use crossterm::{execute, queue};
+use ratatui::backend::CrosstermBackend;
+use ratatui::Terminal;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
@@ -14,22 +23,22 @@ use std::path::PathBuf;
 use std::process::{Command, ExitCode};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// How often the event loop wakes to check on a background close.
-const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// The longest the loop waits for input before it checks on jobs and timers.
+const TICK: Duration = Duration::from_millis(50);
+/// How often bew reloads everything when the events journal is not followed.
+const RELOAD_INTERVAL: Duration = Duration::from_secs(10);
+/// How often bew checks which agent panes are alive.
+const PANES_INTERVAL: Duration = Duration::from_secs(2);
 
-/// How often the event loop wakes to apply live updates; `bd events tail
-/// --follow` itself polls the journal once a second.
-const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HELP: &str = "bew · beads workspace
 
-const HELP: &str = "beads explorer
-
-Usage: be [OPTIONS]
+Usage: bew [OPTIONS]
 
 Options:
       --db <PATH>   Use a specific beads database
-      --bd <PATH>   Path to the bd executable [env: BEADS_EXPLORER_BD]
+      --bd <PATH>   Path to the bd executable [env: BEW_BD]
   -h, --help        Print help
   -V, --version     Print version
 
@@ -37,113 +46,456 @@ Tree:      j/k move · h/l fold · Tab toggle · Enter open (creates on the + Cr
            / go to · q/Esc quit
 Task view: j/k dependency · Enter open · Backspace back · Esc tree · q quit
 Both:      e edit description · et edit title · s set status · p set priority
-           + add child · x close issue (with confirmation)
+           + add child · x close issue · a start agent · f focus agent
+
+Steps:     status, priority, close, add issue and agent replace the screen.
+           Enter applies, Esc cancels; both return to where you were.
 
 Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for text
            Backspace returns to the previous selection · Esc asks before discarding
 
-Live updates need bd 1.3 or later and the workspace's events journal:
-           bd config set events-journal true
+Agents:    a asks for a command, runs it in a new tmux pane to the right and
+           binds the pane to the issue. bew does not change the issue itself.
+           f shows the bound pane. ● marks issues with a live pane.
+
+Refresh:   bew reloads after each action and when the terminal gains focus
+           (in tmux: set -g focus-events on). With the events journal on,
+           changes appear as they land; otherwise bew reloads every 10s.
+           To turn the journal on: bd config set events-journal true
 ";
 
-enum CloseOutcome {
-    Reloaded(IssueGraph),
-    CloseFailed(io::Error),
-    ReloadFailed(io::Error),
-}
+type Backend = CrosstermBackend<Box<dyn Write>>;
 
-/// A `bd close` running on a background thread. `rollback` restores the
-/// pre-close graph if `bd` rejects the close after the optimistic update.
-struct PendingClose {
-    outcome: mpsc::Receiver<CloseOutcome>,
-    rollback: IssueGraph,
-}
-
-impl PendingClose {
-    fn spawn(bd: &Bd, issue_id: String, rollback: IssueGraph) -> Self {
-        let (sender, receiver) = mpsc::channel();
-        let bd = bd.clone();
-        thread::spawn(move || {
-            let outcome = match bd.close_issue(&issue_id) {
-                Err(error) => CloseOutcome::CloseFailed(error),
-                Ok(()) => match bd.load() {
-                    Ok(graph) => CloseOutcome::Reloaded(graph),
-                    Err(error) => CloseOutcome::ReloadFailed(error),
-                },
-            };
-            let _ = sender.send(outcome);
-        });
-        Self {
-            outcome: receiver,
-            rollback,
-        }
-    }
-
-    /// Applies a finished close to `app`; returns itself while still running.
-    fn poll(self, app: &mut App) -> Option<Self> {
-        match self.outcome.try_recv() {
-            Ok(CloseOutcome::Reloaded(graph)) => {
-                app.refresh_graph(graph);
-                app.clear_status();
-            }
-            Ok(CloseOutcome::CloseFailed(error)) => {
-                app.refresh_graph(self.rollback);
-                app.set_status(error.to_string());
-            }
-            Ok(CloseOutcome::ReloadFailed(error)) => {
-                app.set_status(format!("{error} · view may be stale"));
-            }
-            Err(mpsc::TryRecvError::Empty) => return Some(self),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                app.refresh_graph(self.rollback);
-                app.set_status("close failed: background worker died".to_string());
-            }
-        }
-        None
-    }
-}
-
-struct TerminalGuard {
+/// The terminal in raw mode on the alternate screen. ratatui keeps the last
+/// frame and writes only the cells that differ from it.
+struct Tui {
+    terminal: Terminal<Backend>,
     active: bool,
 }
 
-impl TerminalGuard {
-    fn activate(&mut self, out: &mut impl Write) -> io::Result<()> {
-        if !self.active {
-            terminal::enable_raw_mode()?;
-            self.active = true;
-            execute!(out, EnterAlternateScreen, Hide)?;
+impl Tui {
+    fn new() -> io::Result<Self> {
+        let output: Box<dyn Write> =
+            match OpenOptions::new().read(true).write(true).open("/dev/tty") {
+                Ok(tty) => Box::new(BufWriter::new(tty)),
+                Err(_) => Box::new(BufWriter::new(io::stdout())),
+            };
+        let mut tui = Self {
+            terminal: Terminal::new(CrosstermBackend::new(output))?,
+            active: false,
+        };
+        tui.enter()?;
+        Ok(tui)
+    }
+
+    fn enter(&mut self) -> io::Result<()> {
+        if self.active {
+            return Ok(());
         }
+        terminal::enable_raw_mode()?;
+        self.active = true;
+        execute!(
+            self.terminal.backend_mut(),
+            EnterAlternateScreen,
+            Hide,
+            EnableFocusChange,
+            EnableBracketedPaste
+        )?;
+        // The screen may hold anything now, so the next frame draws in full.
+        self.terminal.clear()
+    }
+
+    fn leave(&mut self) -> io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        execute!(
+            self.terminal.backend_mut(),
+            DisableBracketedPaste,
+            DisableFocusChange,
+            LeaveAlternateScreen,
+            Show
+        )?;
+        terminal::disable_raw_mode()?;
+        self.active = false;
         Ok(())
     }
 
-    fn restore(&mut self, out: &mut impl Write) -> io::Result<()> {
-        if self.active {
-            execute!(out, LeaveAlternateScreen, Show)?;
-            terminal::disable_raw_mode()?;
-            self.active = false;
-        }
-        Ok(())
+    fn draw(&mut self, app: &mut App) -> io::Result<()> {
+        queue!(self.terminal.backend_mut(), BeginSynchronizedUpdate)?;
+        self.terminal.draw(|frame| ui::draw(app, frame))?;
+        execute!(self.terminal.backend_mut(), EndSynchronizedUpdate)
     }
 }
 
-impl Drop for TerminalGuard {
+impl Drop for Tui {
     fn drop(&mut self) {
-        if !self.active {
+        let _ = self.leave();
+    }
+}
+
+/// The result of work done on a worker thread.
+enum Done {
+    /// A `bd` write, then a reload. The write's message, or why it failed.
+    Write {
+        seq: u64,
+        created: bool,
+        result: io::Result<(String, io::Result<IssueGraph>)>,
+    },
+    Reload {
+        seq: u64,
+        result: io::Result<IssueGraph>,
+    },
+    Statuses(io::Result<Vec<String>>),
+    Panes(io::Result<HashMap<String, String>>),
+    Agent {
+        issue_id: String,
+        result: io::Result<String>,
+    },
+    Focus(io::Result<()>),
+}
+
+/// Everything the UI thread owns. Only this thread touches `app` and the
+/// terminal; `bd` and `tmux` run on worker threads and report back as `Done`.
+struct Session {
+    app: App,
+    bd: Bd,
+    tui: Tui,
+    live: LiveUpdates,
+    done_sender: mpsc::Sender<Done>,
+    done: mpsc::Receiver<Done>,
+    /// The number of the last graph load started, and of the last applied.
+    /// A load that started before the applied one is stale.
+    seq: u64,
+    applied_seq: u64,
+    /// While a write runs, key presses wait in `held` and run afterwards,
+    /// against the refreshed data.
+    writing: bool,
+    held: VecDeque<Event>,
+    reloads: usize,
+    listing_panes: bool,
+    next_reload: Instant,
+    next_panes: Instant,
+    dirty: bool,
+}
+
+impl Session {
+    fn spawn(&self, job: impl FnOnce() -> Done + Send + 'static) {
+        let sender = self.done_sender.clone();
+        thread::spawn(move || {
+            let _ = sender.send(job());
+        });
+    }
+
+    /// Starts a full reload. Without `force`, it does not start while another
+    /// one runs, so slow reloads do not pile up. No reload starts during a
+    /// write: the write reloads when it finishes.
+    fn reload(&mut self, force: bool) {
+        if self.writing || (!force && self.reloads > 0) {
             return;
         }
-        let _ = terminal::disable_raw_mode();
-        if let Ok(mut tty) = OpenOptions::new().write(true).open("/dev/tty") {
-            let _ = execute!(tty, LeaveAlternateScreen, Show);
-        } else {
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        self.reloads += 1;
+        self.seq += 1;
+        let seq = self.seq;
+        let bd = self.bd.clone();
+        self.spawn(move || Done::Reload {
+            seq,
+            result: bd.load(),
+        });
+    }
+
+    fn list_panes(&mut self) {
+        if !self.app.tmux() || self.listing_panes {
+            return;
+        }
+        self.listing_panes = true;
+        self.spawn(|| Done::Panes(tmux::panes()));
+    }
+
+    /// Runs a `bd` write and a reload on a worker. `busy` shows until it is
+    /// done; `write` returns the message to show on success.
+    fn write(
+        &mut self,
+        busy: String,
+        created: bool,
+        write: impl FnOnce(&Bd) -> io::Result<String> + Send + 'static,
+    ) {
+        self.writing = true;
+        self.app.set_status(busy);
+        self.seq += 1;
+        let seq = self.seq;
+        let bd = self.bd.clone();
+        self.spawn(move || Done::Write {
+            seq,
+            created,
+            result: write(&bd).map(|message| (message, bd.load())),
+        });
+    }
+
+    /// Applies a loaded graph unless a newer load was applied already.
+    fn apply_graph(&mut self, seq: u64, graph: IssueGraph) {
+        if seq <= self.applied_seq {
+            return;
+        }
+        self.applied_seq = seq;
+        if graph != self.app.graph {
+            self.app.refresh_graph(graph);
+            self.dirty = true;
         }
     }
+
+    fn finish(&mut self, done: Done) {
+        match done {
+            Done::Write {
+                seq,
+                created,
+                result,
+            } => {
+                self.writing = false;
+                self.dirty = true;
+                match result {
+                    Err(error) => self.app.set_status(error.to_string()),
+                    Ok((message, graph)) => {
+                        if created {
+                            self.app.finish_add_issue();
+                        }
+                        match graph {
+                            Ok(graph) => {
+                                self.apply_graph(seq, graph);
+                                self.app.set_status(message);
+                            }
+                            Err(error) => self.app.set_status(format!(
+                                "{message}, but reload failed: {error} · view may be stale"
+                            )),
+                        }
+                    }
+                }
+            }
+            Done::Reload { seq, result } => {
+                self.reloads -= 1;
+                match result {
+                    Ok(graph) => self.apply_graph(seq, graph),
+                    Err(error) => {
+                        self.app.set_status(format!("reload failed: {error}"));
+                        self.dirty = true;
+                    }
+                }
+            }
+            Done::Statuses(result) => {
+                // Without an answer, the built-in statuses stay.
+                if let Ok(statuses) = result {
+                    self.app.set_statuses(statuses);
+                }
+            }
+            Done::Panes(result) => {
+                self.listing_panes = false;
+                // No answer means no tmux server, so no live panes.
+                self.dirty |= self.app.set_panes(result.unwrap_or_default());
+            }
+            Done::Agent { issue_id, result } => {
+                match result {
+                    Ok(pane_id) => self
+                        .app
+                        .set_status(format!("Started {pane_id} for {issue_id} · f focus")),
+                    Err(error) => self.app.set_status(error.to_string()),
+                }
+                self.dirty = true;
+                self.list_panes();
+            }
+            Done::Focus(result) => {
+                if let Err(error) = result {
+                    self.app.set_status(error.to_string());
+                    self.dirty = true;
+                }
+            }
+        }
+    }
+
+    /// Handles one terminal event; returns true to quit.
+    fn handle_event(&mut self, event: Event) -> io::Result<bool> {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => {
+                self.dirty = true;
+                let action = self.app.handle_key(key);
+                self.act(action)
+            }
+            Event::Paste(text) => {
+                self.dirty = true;
+                self.app.handle_paste(&text);
+                Ok(false)
+            }
+            Event::FocusGained => {
+                self.reload(true);
+                self.list_panes();
+                Ok(false)
+            }
+            Event::Resize(..) => {
+                self.dirty = true;
+                Ok(false)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Carries out an action from the app; returns true to quit.
+    fn act(&mut self, action: Action) -> io::Result<bool> {
+        match action {
+            Action::Quit => return Ok(true),
+            Action::None => {}
+            Action::CloseIssue(issue_id) => {
+                self.write(format!("Closing {issue_id}…"), false, move |bd| {
+                    bd.close_issue(&issue_id)?;
+                    Ok(format!("Closed {issue_id}"))
+                });
+            }
+            Action::SetStatus(issue_id, status) => {
+                self.write(
+                    format!("Setting {issue_id} to {status}…"),
+                    false,
+                    move |bd| {
+                        bd.set_status(&issue_id, &status)?;
+                        Ok(format!("Set {issue_id} to {status}"))
+                    },
+                );
+            }
+            Action::SetPriority(issue_id, priority) => {
+                self.write(
+                    format!("Setting {issue_id} to P{priority}…"),
+                    false,
+                    move |bd| {
+                        bd.set_priority(&issue_id, priority)?;
+                        Ok(format!("Set {issue_id} to P{priority}"))
+                    },
+                );
+            }
+            Action::CreateIssue(draft) => {
+                self.write("Creating issue…".to_string(), true, move |bd| {
+                    let issue_id = bd.create_issue(&draft)?;
+                    Ok(match &draft.parent_id {
+                        Some(parent_id) => format!("Created {issue_id} under {parent_id}"),
+                        None => format!("Created {issue_id}"),
+                    })
+                });
+            }
+            Action::Edit(field) => {
+                let Some(issue_id) = self.app.current_issue().map(|issue| issue.id.clone()) else {
+                    return Ok(false);
+                };
+                self.tui.leave()?;
+                let result = self.bd.edit(field, &issue_id);
+                self.tui.enter()?;
+                if let Err(error) = result {
+                    self.app.set_status(error.to_string());
+                }
+                // A reload that started before the edit would miss it.
+                self.reload(true);
+            }
+            Action::EditAddIssue(field) => {
+                let initial = self.app.add_issue_field(field).unwrap_or("").to_string();
+                self.tui.leave()?;
+                let result = edit_add_issue_field(&initial);
+                self.tui.enter()?;
+                match result {
+                    Ok(value) => self.app.set_add_issue_field(field, value),
+                    Err(error) => self.app.set_status(error.to_string()),
+                }
+            }
+            Action::StartAgent { issue_id, command } => {
+                self.app
+                    .set_status(format!("Starting a pane for {issue_id}…"));
+                let cwd = env::current_dir()?;
+                self.spawn(move || Done::Agent {
+                    result: tmux::start(&command, &cwd, &issue_id),
+                    issue_id,
+                });
+            }
+            Action::FocusAgent(pane_id) => {
+                self.spawn(move || Done::Focus(tmux::focus(&pane_id)));
+            }
+        }
+        Ok(false)
+    }
+
+    fn run(&mut self) -> io::Result<()> {
+        loop {
+            // Wait for input, then take every event that is already queued,
+            // so a burst of keys or a resize costs one draw.
+            let timeout = self
+                .app
+                .pending_key_timeout()
+                .map_or(TICK, |remaining| remaining.min(TICK));
+            if event::poll(timeout)? {
+                loop {
+                    let event = event::read()?;
+                    if is_ctrl_c(&event) {
+                        return Ok(());
+                    }
+                    self.held.push_back(event);
+                    if !event::poll(Duration::ZERO)? {
+                        break;
+                    }
+                }
+            }
+
+            while let Ok(done) = self.done.try_recv() {
+                self.finish(done);
+            }
+
+            while !self.writing {
+                let Some(event) = self.held.pop_front() else {
+                    break;
+                };
+                if self.handle_event(event)? {
+                    return Ok(());
+                }
+            }
+            if !self.writing
+                && self
+                    .app
+                    .pending_key_timeout()
+                    .is_some_and(|remaining| remaining.is_zero())
+            {
+                self.dirty = true;
+                let action = self.app.flush_pending_key();
+                if self.act(action)? {
+                    return Ok(());
+                }
+            }
+
+            self.dirty |= self.live.poll(&mut self.app);
+
+            let now = Instant::now();
+            if now >= self.next_reload {
+                self.next_reload = now + RELOAD_INTERVAL;
+                // The journal brings changes on its own; a step holds a
+                // choice the user is making, so it is not reloaded under them.
+                if !self.live.is_following() && self.app.step().is_none() {
+                    self.reload(false);
+                }
+            }
+            if now >= self.next_panes {
+                self.next_panes = now + PANES_INTERVAL;
+                self.list_panes();
+            }
+
+            if self.dirty {
+                self.tui.draw(&mut self.app)?;
+                self.dirty = false;
+            }
+        }
+    }
+}
+
+fn is_ctrl_c(event: &Event) -> bool {
+    matches!(event, Event::Key(key)
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Char('c')
+            && key.modifiers.contains(KeyModifiers::CONTROL))
 }
 
 fn parse_args() -> Result<Option<Bd>, String> {
     let mut args = env::args_os().skip(1);
-    let mut bd = env::var_os("BEADS_EXPLORER_BD").unwrap_or_else(|| OsString::from("bd"));
+    let mut bd = env::var_os("BEW_BD").unwrap_or_else(|| OsString::from("bd"));
     let mut db = None;
     while let Some(argument) = args.next() {
         match argument.to_string_lossy().as_ref() {
@@ -152,7 +504,7 @@ fn parse_args() -> Result<Option<Bd>, String> {
                 return Ok(None);
             }
             "-V" | "--version" => {
-                println!("be {}", env!("CARGO_PKG_VERSION"));
+                println!("bew {}", env!("CARGO_PKG_VERSION"));
                 return Ok(None);
             }
             "--bd" => {
@@ -177,12 +529,12 @@ fn edit_add_issue_field(initial: &str) -> io::Result<String> {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let path = env::temp_dir().join(format!("be-add-{}-{nonce}.md", std::process::id()));
+    let path = env::temp_dir().join(format!("bew-add-{}-{nonce}.md", std::process::id()));
     fs::write(&path, initial)?;
 
     let result = (|| {
         let status = Command::new("sh")
-            .args(["-c", "exec ${VISUAL:-${EDITOR:-vi}} \"$1\"", "be-editor"])
+            .args(["-c", "exec ${VISUAL:-${EDITOR:-vi}} \"$1\"", "bew-editor"])
             .arg(&path)
             .status()
             .map_err(|error| {
@@ -197,160 +549,34 @@ fn edit_add_issue_field(initial: &str) -> io::Result<String> {
     result
 }
 
-fn read_key_action(app: &mut App) -> io::Result<Action> {
-    Ok(match event::read()? {
-        Event::Key(key) if key.kind == KeyEventKind::Press => app.handle_key(key),
-        _ => Action::None,
-    })
-}
-
-/// Waits for the next terminal event, waking early after `wake_after` or
-/// when a pending `e` chord times out. `None` means it woke with nothing to do.
-fn next_action(app: &mut App, wake_after: Option<Duration>) -> io::Result<Option<Action>> {
-    let timeout = match (app.pending_key_timeout(), wake_after) {
-        (Some(key_timeout), Some(wake_after)) => Some(key_timeout.min(wake_after)),
-        (key_timeout, wake_after) => key_timeout.or(wake_after),
-    };
-    let Some(timeout) = timeout else {
-        return read_key_action(app).map(Some);
-    };
-    if event::poll(timeout)? {
-        read_key_action(app).map(Some)
-    } else if app
-        .pending_key_timeout()
-        .is_some_and(|remaining| remaining.is_zero())
-    {
-        Ok(Some(app.flush_pending_key()))
-    } else {
-        Ok(None)
-    }
-}
-
-/// Reloads the whole graph after a successful `bd` write, since a create or a
-/// status change can move issues in or out of the tree.
-fn reload_after_write(app: &mut App, bd: &Bd, success: String) {
-    match bd.load() {
-        Ok(graph) => {
-            app.refresh_graph(graph);
-            app.set_status(success);
-        }
-        Err(error) => app.set_status(format!(
-            "{success}, but reload failed: {error} · view may be stale"
-        )),
-    }
-}
-
 fn run(bd: Bd) -> io::Result<()> {
+    // The first load happens before the screen changes, so a failure prints
+    // as a plain error.
     let mut app = App::new(bd.load()?);
-
-    let output: Box<dyn Write> = match OpenOptions::new().read(true).write(true).open("/dev/tty") {
-        Ok(tty) => Box::new(tty),
-        Err(_) => Box::new(io::stdout()),
+    app.set_tmux(tmux::available());
+    let tui = Tui::new()?;
+    let (done_sender, done) = mpsc::channel();
+    let now = Instant::now();
+    let mut session = Session {
+        live: LiveUpdates::spawn(&bd),
+        app,
+        bd,
+        tui,
+        done_sender,
+        done,
+        seq: 0,
+        applied_seq: 0,
+        writing: false,
+        held: VecDeque::new(),
+        reloads: 0,
+        listing_panes: false,
+        next_reload: now + RELOAD_INTERVAL,
+        next_panes: now,
+        dirty: true,
     };
-    let mut out = BufWriter::new(output);
-    let mut guard = TerminalGuard { active: false };
-    guard.activate(&mut out)?;
-
-    let mut pending_close: Option<PendingClose> = None;
-    let mut live = LiveUpdates::spawn(&bd);
-    // Live updates wake the loop several times a second, so draw only after
-    // something changed.
-    let mut needs_draw = true;
-
-    loop {
-        if let Some(pending) = pending_close.take() {
-            pending_close = pending.poll(&mut app);
-            needs_draw |= pending_close.is_none();
-        }
-        needs_draw |= live.poll(&mut app);
-
-        if needs_draw {
-            let (width, height) = terminal::size()?;
-            ui::draw(&mut app, &mut out, width, height)?;
-            needs_draw = false;
-        }
-
-        let wake_after = if pending_close.is_some() {
-            Some(CLOSE_POLL_INTERVAL)
-        } else if live.is_following() {
-            Some(LIVE_POLL_INTERVAL)
-        } else {
-            None
-        };
-        let Some(action) = next_action(&mut app, wake_after)? else {
-            continue;
-        };
-        needs_draw = true;
-        match action {
-            Action::Quit => break,
-            Action::CloseIssue(_)
-            | Action::Edit(_)
-            | Action::EditAddIssue(_)
-            | Action::CreateIssue(_)
-            | Action::SetStatus(..)
-            | Action::SetPriority(..)
-                if pending_close.is_some() =>
-            {
-                app.set_status("waiting for the previous close to finish".to_string());
-            }
-            Action::CloseIssue(issue_id) => {
-                let rollback = app.graph.clone();
-                let optimistic = app.graph.with_issue_closed(&issue_id);
-                app.return_to_tree();
-                app.refresh_graph(optimistic);
-                app.set_status(format!("Closing {issue_id}…"));
-                pending_close = Some(PendingClose::spawn(&bd, issue_id, rollback));
-            }
-            Action::Edit(field) => {
-                let Some(issue_id) = app.current_issue().map(|issue| issue.id.clone()) else {
-                    continue;
-                };
-                guard.restore(&mut out)?;
-                let edit_result = bd
-                    .edit(field, &issue_id)
-                    .and_then(|_| bd.load_issue(&issue_id));
-                guard.activate(&mut out)?;
-                match edit_result {
-                    Ok(issue) => app.graph.replace_issue(issue),
-                    Err(error) => app.set_status(error.to_string()),
-                }
-            }
-            Action::EditAddIssue(field) => {
-                let initial = app.add_issue_field(field).unwrap_or("").to_string();
-                guard.restore(&mut out)?;
-                let edit_result = edit_add_issue_field(&initial);
-                guard.activate(&mut out)?;
-                match edit_result {
-                    Ok(value) => app.set_add_issue_field(field, value),
-                    Err(error) => app.set_status(error.to_string()),
-                }
-            }
-            Action::CreateIssue(draft) => match bd.create_issue(&draft) {
-                Ok(issue_id) => {
-                    app.finish_add_issue();
-                    let created = match &draft.parent_id {
-                        Some(parent_id) => format!("Created {issue_id} under {parent_id}"),
-                        None => format!("Created {issue_id}"),
-                    };
-                    reload_after_write(&mut app, &bd, created);
-                }
-                Err(error) => app.set_status(error.to_string()),
-            },
-            Action::SetStatus(issue_id, status) => match bd.set_status(&issue_id, status) {
-                Ok(()) => reload_after_write(&mut app, &bd, format!("Set {issue_id} to {status}")),
-                Err(error) => app.set_status(error.to_string()),
-            },
-            Action::SetPriority(issue_id, priority) => match bd.set_priority(&issue_id, priority) {
-                Ok(()) => {
-                    reload_after_write(&mut app, &bd, format!("Set {issue_id} to P{priority}"))
-                }
-                Err(error) => app.set_status(error.to_string()),
-            },
-            Action::None => {}
-        }
-    }
-
-    guard.restore(&mut out)
+    let bd = session.bd.clone();
+    session.spawn(move || Done::Statuses(bd.statuses()));
+    session.run()
 }
 
 fn main() -> ExitCode {
@@ -358,7 +584,7 @@ fn main() -> ExitCode {
         Ok(Some(bd)) => bd,
         Ok(None) => return ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("be: {message}");
+            eprintln!("bew: {message}");
             return ExitCode::from(2);
         }
     };
@@ -366,7 +592,7 @@ fn main() -> ExitCode {
     match run(bd) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("be: {error}");
+            eprintln!("bew: {error}");
             ExitCode::FAILURE
         }
     }

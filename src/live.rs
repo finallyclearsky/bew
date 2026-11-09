@@ -2,7 +2,8 @@
 //! journal's head, takes a fresh baseline with `bd list`, then follows
 //! `bd events tail --follow` from that head, so no change between the two
 //! reads is lost. Replaying a record twice is harmless: each one carries the
-//! issue's full state after the change.
+//! issue's full state after the change. If the follower exits, the thread
+//! waits and starts over from a fresh baseline.
 
 use crate::app::App;
 use crate::model::{Bd, IssueGraph, JournalHead, JournalRecord};
@@ -10,15 +11,29 @@ use std::io::{self, BufRead, BufReader};
 use std::process::Child;
 use std::sync::{mpsc, Arc, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::{Duration, Instant};
 
-const ENABLE_HINT: &str = "live updates off · enable with: bd config set events-journal true";
+const ENABLE_HINT: &str =
+    "events journal off · reloading every 10s · for live updates: bd config set events-journal true";
+
+/// The first wait before following again after the follower exits.
+const FIRST_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// The longest wait between attempts.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+/// A follower that ran this long counts as healthy, so the wait resets.
+const HEALTHY_RUN: Duration = Duration::from_secs(60);
+/// How often a waiting thread checks whether bew has quit.
+const STOP_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 enum Update {
     /// A `bd list` taken after the journal head was read; the records that
     /// follow apply on top of it.
     Baseline(IssueGraph),
+    /// The follower is running, so records arrive as changes land.
+    Following,
     Record(JournalRecord),
-    /// Live updates ended; the message says why.
+    /// The follower is not running; the message says why and whether it
+    /// will start again.
     Stopped(String),
 }
 
@@ -49,17 +64,18 @@ impl LiveUpdates {
         Self {
             updates,
             follower,
-            following: true,
+            following: false,
         }
     }
 
-    /// Whether updates can still arrive, so the event loop must keep waking.
+    /// Whether the follower is running, so changes made elsewhere arrive on
+    /// their own and periodic reloads are not needed.
     pub fn is_following(&self) -> bool {
         self.following
     }
 
     /// Applies everything the follower sent since the last call; returns
-    /// whether the app changed.
+    /// whether the graph or the status line changed.
     pub fn poll(&mut self, app: &mut App) -> bool {
         let mut records = Vec::new();
         let mut changed = false;
@@ -68,9 +84,12 @@ impl LiveUpdates {
                 Ok(Update::Baseline(graph)) => {
                     // A baseline is newer than any record queued before it.
                     records.clear();
-                    app.refresh_graph(graph);
-                    changed = true;
+                    if graph != app.graph {
+                        app.refresh_graph(graph);
+                        changed = true;
+                    }
                 }
+                Ok(Update::Following) => self.following = true,
                 Ok(Update::Record(record)) => records.push(record),
                 Ok(Update::Stopped(message)) => {
                     app.set_status(message);
@@ -86,8 +105,10 @@ impl LiveUpdates {
         }
         if !records.is_empty() {
             let graph = app.graph.with_records(&records);
-            app.refresh_graph(graph);
-            changed = true;
+            if graph != app.graph {
+                app.refresh_graph(graph);
+                changed = true;
+            }
         }
         changed
     }
@@ -108,68 +129,135 @@ fn lock(follower: &Mutex<Follower>) -> MutexGuard<'_, Follower> {
     follower.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Follows the journal until it fails; returns why it stopped, or `None`
-/// once `LiveUpdates` has been dropped.
+/// How one attempt to follow the journal ended.
+enum Run {
+    /// bew quit.
+    Quit,
+    /// A prune passed our position; follow again from a fresh baseline.
+    Truncated,
+    /// The baseline or the follower failed; the message says why.
+    Ended(String),
+}
+
+/// Follows the journal, starting over after every failure. Returns why
+/// live updates are off for good, or `None` once `LiveUpdates` is dropped.
 fn follow(bd: &Bd, updates: &mpsc::Sender<Update>, follower: &Mutex<Follower>) -> Option<String> {
+    let mut delay = FIRST_RETRY_DELAY;
+    // Before the journal answers once, a failure means this `bd` cannot
+    // follow at all, such as one older than 1.3; afterwards it is transient.
+    let mut answered = false;
     loop {
-        let since = match bd.journal_head() {
-            Ok(JournalHead::At(seq)) => seq,
+        let started = Instant::now();
+        let reason = match bd.journal_head() {
             Ok(JournalHead::Disabled) => return Some(ENABLE_HINT.to_string()),
-            Err(error) => return Some(format!("live updates unavailable: {}", first_line(&error))),
-        };
-        let graph = match bd.load() {
-            Ok(graph) => graph,
-            Err(error) => return Some(format!("live updates stopped: {}", first_line(&error))),
-        };
-        updates.send(Update::Baseline(graph)).ok()?;
-
-        let mut child = match bd.follow_journal(since) {
-            Ok(child) => child,
-            Err(error) => return Some(format!("live updates stopped: {}", first_line(&error))),
-        };
-        let stdout = child.stdout.take()?;
-        {
-            let mut follower = lock(follower);
-            if follower.stopped {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
+            Err(error) if !answered => {
+                return Some(format!("live updates unavailable: {}", first_line(&error)));
             }
-            follower.child = Some(child);
-        }
-
-        let mut truncated = false;
-        for line in BufReader::new(stdout).lines() {
-            let Ok(line) = line else {
-                break;
-            };
-            if let Ok(record) = serde_json::from_str::<JournalRecord>(&line) {
-                updates.send(Update::Record(record)).ok()?;
-            } else if line.contains("events_journal_truncated") {
-                // A prune passed our position; `bd` exits after this line.
-                truncated = true;
+            Err(error) => first_line(&error),
+            Ok(JournalHead::At(since)) => {
+                answered = true;
+                match follow_once(bd, updates, follower, since) {
+                    Run::Quit => return None,
+                    Run::Truncated => continue,
+                    Run::Ended(reason) => reason,
+                }
             }
-        }
-
-        let child = {
-            let mut follower = lock(follower);
-            if follower.stopped {
-                return None;
-            }
-            follower.child.take()
         };
-        if !truncated {
-            let status = child.and_then(|mut child| child.wait().ok());
-            return Some(match status {
-                Some(status) => format!("live updates stopped: bd events tail exited ({status})"),
-                None => "live updates stopped".to_string(),
-            });
+        if started.elapsed() >= HEALTHY_RUN {
+            delay = FIRST_RETRY_DELAY;
         }
-        // Re-baseline and follow again from the new head.
-        if let Some(mut child) = child {
+        let message = format!(
+            "live updates interrupted: {reason} · retrying in {}s",
+            delay.as_secs()
+        );
+        updates.send(Update::Stopped(message)).ok()?;
+        if !sleep_unless_stopped(follower, delay) {
+            return None;
+        }
+        delay = (delay * 2).min(MAX_RETRY_DELAY);
+    }
+}
+
+/// Sends a fresh baseline, then follows the journal from `since` until the
+/// follower exits.
+fn follow_once(
+    bd: &Bd,
+    updates: &mpsc::Sender<Update>,
+    follower: &Mutex<Follower>,
+    since: i64,
+) -> Run {
+    let graph = match bd.load() {
+        Ok(graph) => graph,
+        Err(error) => return Run::Ended(first_line(&error)),
+    };
+    if updates.send(Update::Baseline(graph)).is_err() {
+        return Run::Quit;
+    }
+
+    let mut child = match bd.follow_journal(since) {
+        Ok(child) => child,
+        Err(error) => return Run::Ended(first_line(&error)),
+    };
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Run::Ended("bd events tail has no output".to_string());
+    };
+    {
+        let mut follower = lock(follower);
+        if follower.stopped {
+            let _ = child.kill();
             let _ = child.wait();
+            return Run::Quit;
+        }
+        follower.child = Some(child);
+    }
+    if updates.send(Update::Following).is_err() {
+        return Run::Quit;
+    }
+
+    let mut truncated = false;
+    for line in BufReader::new(stdout).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        if let Ok(record) = serde_json::from_str::<JournalRecord>(&line) {
+            if updates.send(Update::Record(record)).is_err() {
+                return Run::Quit;
+            }
+        } else if line.contains("events_journal_truncated") {
+            // `bd` exits after this line.
+            truncated = true;
         }
     }
+
+    let child = {
+        let mut follower = lock(follower);
+        if follower.stopped {
+            return Run::Quit;
+        }
+        follower.child.take()
+    };
+    let status = child.and_then(|mut child| child.wait().ok());
+    if truncated {
+        return Run::Truncated;
+    }
+    Run::Ended(match status {
+        Some(status) => format!("bd events tail exited ({status})"),
+        None => "bd events tail exited".to_string(),
+    })
+}
+
+/// Waits `delay`; returns `false` early if `LiveUpdates` was dropped.
+fn sleep_unless_stopped(follower: &Mutex<Follower>, delay: Duration) -> bool {
+    let deadline = Instant::now() + delay;
+    while Instant::now() < deadline {
+        if lock(follower).stopped {
+            return false;
+        }
+        thread::sleep(STOP_CHECK_INTERVAL.min(deadline.saturating_duration_since(Instant::now())));
+    }
+    !lock(follower).stopped
 }
 
 /// The status line has one row, and `bd` errors can span several.
@@ -219,10 +307,9 @@ esac"#,
         assert!(app.graph.is_listed("a"), "baseline applied");
         assert!(app.graph.is_listed("b"), "followed record applied");
         assert!(!live.is_following());
-        assert!(app
-            .status_message()
-            .unwrap()
-            .contains("live updates stopped"));
+        let status = app.status_message().unwrap();
+        assert!(status.contains("live updates interrupted"), "{status}");
+        assert!(status.contains("retrying in 1s"), "{status}");
         let calls = fake.arguments().join(" ");
         assert!(
             calls.starts_with(
@@ -230,6 +317,36 @@ esac"#,
             ),
             "{calls}"
         );
+    }
+
+    #[test]
+    fn an_exited_follower_starts_again_from_a_fresh_baseline() {
+        let fake = FakeBd::script(
+            "live-retry",
+            r#"case "$*" in
+  "events tail --since 0 --json") : ;;
+  "list --all --json") printf '%s\n' '[{"id":"a","title":"A","status":"open"}]' ;;
+esac"#,
+        );
+        let mut app = App::new(IssueGraph::default());
+        let mut live = LiveUpdates::spawn(&fake.bd(None));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let baselines = || {
+            fake.arguments()
+                .iter()
+                .filter(|argument| *argument == "list")
+                .count()
+        };
+        while baselines() < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "the follower never started again"
+            );
+            live.poll(&mut app);
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(app.graph.is_listed("a"));
     }
 
     #[test]
