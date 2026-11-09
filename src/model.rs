@@ -2,9 +2,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
 
 // `bd show` hydrates dependencies into issue summaries (`id`, `title`, ...),
 // while `bd list` emits raw edge records (`depends_on_id`, `type`, ...). The
@@ -59,6 +59,37 @@ pub struct AddIssueDraft {
     pub description: String,
     pub issue_type: String,
     pub priority: i32,
+}
+
+/// One record from `bd events tail`. `issue` is the full state after the
+/// change, `null` on a delete, and never carries dependencies: those change
+/// through `dep_add` / `dep_remove` records, which name the edge in `dep`.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct JournalRecord {
+    pub op: String,
+    pub issue_id: String,
+    pub issue: Option<Issue>,
+    pub dep: Option<JournalDep>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
+pub struct JournalDep {
+    pub kind: String,
+    pub target: String,
+}
+
+/// Where to start following the events journal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum JournalHead {
+    /// The workspace does not record changes (`events-journal` is off).
+    Disabled,
+    /// The highest `seq` assigned so far; 0 for an empty journal.
+    At(i64),
+}
+
+/// The tree shows open and in-progress issues; the rest are context.
+fn is_listed_status(status: &str) -> bool {
+    matches!(status, "open" | "in_progress")
 }
 
 #[derive(Clone, Debug, Default)]
@@ -191,25 +222,80 @@ impl IssueGraph {
     /// Optimistic local mirror of `bd close`: the issue leaves the listed set
     /// and joins the context issues, so the UI can update before `bd` confirms.
     pub fn with_issue_closed(&self, issue_id: &str) -> IssueGraph {
-        let listed_issues: Vec<Issue> = self
+        let closed = self.issues.get(issue_id).map(|issue| Issue {
+            status: "closed".to_string(),
+            ..issue.clone()
+        });
+        self.with_records(&[JournalRecord {
+            op: "close".to_string(),
+            issue_id: issue_id.to_string(),
+            issue: closed,
+            dep: None,
+        }])
+    }
+
+    /// Replays journal records onto a copy of this graph. Snapshots carry no
+    /// dependencies, so an issue keeps the edges already known for it and
+    /// `dep_*` records edit them. The tree keeps its order; issues that join
+    /// it go last.
+    pub fn with_records(&self, records: &[JournalRecord]) -> IssueGraph {
+        let mut issues = self.issues.clone();
+        let mut touched = Vec::new();
+        for record in records {
+            if record.op == "delete" {
+                issues.remove(&record.issue_id);
+                continue;
+            }
+            if let Some(snapshot) = &record.issue {
+                let dependencies = issues
+                    .remove(&snapshot.id)
+                    .map(|known| known.dependencies)
+                    .unwrap_or_default();
+                touched.push(snapshot.id.clone());
+                issues.insert(
+                    snapshot.id.clone(),
+                    Issue {
+                        dependencies,
+                        ..snapshot.clone()
+                    },
+                );
+            }
+            if let (Some(dep), Some(issue)) = (&record.dep, issues.get_mut(&record.issue_id)) {
+                // `dep_add` is an upsert: a re-add only refreshes the edge.
+                issue
+                    .dependencies
+                    .retain(|known| known.id != dep.target || known.dependency_type != dep.kind);
+                if record.op == "dep_add" {
+                    issue.dependencies.push(Dependency {
+                        id: dep.target.clone(),
+                        dependency_type: dep.kind.clone(),
+                        ..Dependency::default()
+                    });
+                }
+            }
+        }
+
+        // A record decides whether its issue is listed; others keep their place.
+        let touched_ids: HashSet<&str> = touched.iter().map(String::as_str).collect();
+        let mut seen = HashSet::new();
+        let listed: Vec<Issue> = self
             .order
             .iter()
-            .filter(|id| id.as_str() != issue_id)
-            .filter_map(|id| self.issues.get(id))
+            .chain(&touched)
+            .filter(|id| seen.insert(id.as_str()))
+            .filter_map(|id| issues.get(id))
+            .filter(|issue| {
+                !touched_ids.contains(issue.id.as_str()) || is_listed_status(&issue.status)
+            })
             .cloned()
             .collect();
-        let mut context: Vec<Issue> = self
-            .issues
+        let listed_ids: HashSet<&str> = listed.iter().map(|issue| issue.id.as_str()).collect();
+        let context: Vec<Issue> = issues
             .values()
-            .filter(|issue| !self.listed.contains(&issue.id))
+            .filter(|issue| !listed_ids.contains(issue.id.as_str()))
             .cloned()
             .collect();
-        if let Some(issue) = self.issues.get(issue_id) {
-            let mut issue = issue.clone();
-            issue.status = "closed".to_string();
-            context.push(issue);
-        }
-        IssueGraph::new(listed_issues, context)
+        IssueGraph::new(listed, context)
     }
 }
 
@@ -239,30 +325,40 @@ impl Bd {
         command
     }
 
-    /// Runs to completion; a non-zero exit becomes an error built from stderr,
-    /// or stdout when stderr is empty.
-    fn run(&self, verb: &str, command: &mut Command) -> io::Result<Output> {
-        let output = command.output().map_err(|error| {
-            io::Error::new(
-                error.kind(),
-                format!("could not run {}: {error}", self.name()),
-            )
-        })?;
-        if output.status.success() {
-            return Ok(output);
-        }
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
+    fn spawn_error(&self, error: io::Error) -> io::Error {
+        io::Error::new(
+            error.kind(),
+            format!("could not run {}: {error}", self.name()),
+        )
+    }
+
+    /// A non-zero exit as an error built from stderr, or stdout when stderr
+    /// is empty.
+    fn failure(&self, verb: &str, status: ExitStatus, stderr: &str, stdout: &str) -> io::Error {
         let message = if stderr.trim().is_empty() {
             stdout.trim()
         } else {
             stderr.trim()
         };
-        Err(io::Error::other(if message.is_empty() {
-            format!("{} {verb} failed: {}", self.name(), output.status)
+        io::Error::other(if message.is_empty() {
+            format!("{} {verb} failed: {status}", self.name())
         } else {
             format!("{} {verb} failed: {message}", self.name())
-        }))
+        })
+    }
+
+    /// Runs to completion; a non-zero exit becomes an error.
+    fn run(&self, verb: &str, command: &mut Command) -> io::Result<Output> {
+        let output = command.output().map_err(|error| self.spawn_error(error))?;
+        if output.status.success() {
+            return Ok(output);
+        }
+        Err(self.failure(
+            verb,
+            output.status,
+            &String::from_utf8_lossy(&output.stderr),
+            &String::from_utf8_lossy(&output.stdout),
+        ))
     }
 
     fn run_json(&self, args: &[&str]) -> io::Result<Value> {
@@ -283,7 +379,7 @@ impl Bd {
         let issues = parse_issue_collection(self.run_json(&["list", "--all", "--json"])?)?;
         let (listed, context): (Vec<Issue>, Vec<Issue>) = issues
             .into_iter()
-            .partition(|issue| matches!(issue.status.as_str(), "open" | "in_progress"));
+            .partition(|issue| is_listed_status(&issue.status));
         if listed.is_empty() {
             return Ok(IssueGraph::default());
         }
@@ -312,12 +408,7 @@ impl Bd {
         let status = self
             .command(&["edit", issue_id, flag])
             .status()
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("could not run {}: {error}", self.name()),
-                )
-            })?;
+            .map_err(|error| self.spawn_error(error))?;
         if status.success() {
             Ok(())
         } else {
@@ -328,23 +419,95 @@ impl Bd {
         }
     }
 
+    /// Reads the whole retained journal for its last `seq`, the position to
+    /// follow from. A pruned journal refuses `--since 0` but reports its head.
+    pub fn journal_head(&self) -> io::Result<JournalHead> {
+        let mut child = self
+            .command(&["events", "tail", "--since", "0", "--json"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|error| self.spawn_error(error))?;
+        // A record is one line but a refusal is pretty-printed, so keep the
+        // lines of the last JSON value only; the journal can hold 100k records.
+        let mut last = String::new();
+        if let Some(stdout) = child.stdout.take() {
+            for line in BufReader::new(stdout).lines() {
+                let line = line?;
+                if line.starts_with('{') {
+                    last.clear();
+                }
+                last.push_str(&line);
+            }
+        }
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+            pipe.read_to_string(&mut stderr)?;
+        }
+        let status = child.wait()?;
+        // `bd` serves an off journal's old records and says so only on stderr.
+        if stderr.contains("events journal is disabled") {
+            return Ok(JournalHead::Disabled);
+        }
+
+        #[derive(Deserialize)]
+        struct Position {
+            seq: Option<i64>,
+            head: Option<i64>,
+        }
+        let position = serde_json::from_str::<Position>(&last).ok();
+        let seq = if status.success() {
+            position.and_then(|position| position.seq)
+        } else {
+            position.and_then(|position| position.head)
+        };
+        match seq {
+            Some(seq) => Ok(JournalHead::At(seq)),
+            None if status.success() && last.is_empty() => Ok(JournalHead::At(0)),
+            None if status.success() => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} returned an invalid events record", self.name()),
+            )),
+            None => Err(self.failure("events", status, &stderr, &last)),
+        }
+    }
+
+    /// Starts `bd events tail --follow` after `since`. The caller reads one
+    /// JSON record per stdout line and kills the child when done.
+    pub fn follow_journal(&self, since: i64) -> io::Result<Child> {
+        self.command(&[
+            "events",
+            "tail",
+            "--since",
+            &since.to_string(),
+            "--follow",
+            "--json",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|error| self.spawn_error(error))
+    }
+
     pub fn close_issue(&self, issue_id: &str) -> io::Result<()> {
         self.run("close", &mut self.command(&["close", issue_id]))
             .map(|_| ())
     }
 
     pub fn set_status(&self, issue_id: &str, status: &str) -> io::Result<()> {
-        self.run(
-            "update",
-            &mut self.command(&["update", issue_id, "--status", status]),
-        )
-        .map(|_| ())
+        self.update(issue_id, "--status", status)
     }
 
     pub fn set_priority(&self, issue_id: &str, priority: i32) -> io::Result<()> {
+        self.update(issue_id, "--priority", &format!("P{priority}"))
+    }
+
+    fn update(&self, issue_id: &str, flag: &str, value: &str) -> io::Result<()> {
         self.run(
             "update",
-            &mut self.command(&["update", issue_id, "--priority", &format!("P{priority}")]),
+            &mut self.command(&["update", issue_id, flag, value]),
         )
         .map(|_| ())
     }
@@ -415,11 +578,7 @@ mod tests {
     use super::*;
 
     #[cfg(unix)]
-    use std::fs;
-    #[cfg(unix)]
-    use std::os::unix::fs::PermissionsExt;
-    #[cfg(unix)]
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::test_support::FakeBd;
 
     fn issue(id: &str, deps: &[&str]) -> Issue {
         Issue {
@@ -487,6 +646,111 @@ mod tests {
         assert_eq!(closed.issue("a").unwrap().status, "closed");
     }
 
+    fn snapshot(id: &str, status: &str) -> Issue {
+        Issue {
+            id: id.to_string(),
+            title: id.to_string(),
+            status: status.to_string(),
+            ..Issue::default()
+        }
+    }
+
+    fn record(op: &str, issue_id: &str, issue: Option<Issue>) -> JournalRecord {
+        JournalRecord {
+            op: op.to_string(),
+            issue_id: issue_id.to_string(),
+            issue,
+            dep: None,
+        }
+    }
+
+    fn dep_record(op: &str, issue_id: &str, kind: &str, target: &str) -> JournalRecord {
+        JournalRecord {
+            dep: Some(JournalDep {
+                kind: kind.to_string(),
+                target: target.to_string(),
+            }),
+            ..record(op, issue_id, None)
+        }
+    }
+
+    #[test]
+    fn records_move_issues_in_and_out_of_the_tree_in_order() {
+        let graph = IssueGraph::new(
+            vec![snapshot("a", "open"), snapshot("b", "open")],
+            vec![snapshot("z", "closed")],
+        );
+
+        let next = graph.with_records(&[
+            record("create", "c", Some(snapshot("c", "open"))),
+            record("close", "a", Some(snapshot("a", "closed"))),
+            record("update", "z", Some(snapshot("z", "open"))),
+            record("delete", "b", None),
+        ]);
+
+        assert_eq!(next.roots(), &["c", "z"]);
+        assert!(!next.is_listed("a"));
+        assert_eq!(next.issue("a").unwrap().status, "closed");
+        assert!(next.issue("b").is_none());
+    }
+
+    #[test]
+    fn records_keep_known_edges_and_apply_dependency_changes() {
+        let mut child = snapshot("c", "open");
+        child.dependencies.push(Dependency {
+            id: "p".to_string(),
+            dependency_type: "parent-child".to_string(),
+            ..Dependency::default()
+        });
+        let graph = IssueGraph::new(vec![snapshot("p", "open"), child], vec![]);
+
+        let renamed = Issue {
+            title: "renamed".to_string(),
+            ..snapshot("c", "open")
+        };
+        let updated = graph.with_records(&[record("update", "c", Some(renamed))]);
+        assert_eq!(updated.issue("c").unwrap().title, "renamed");
+        assert_eq!(
+            updated.tree_children("p"),
+            &["c"],
+            "snapshots carry no edges"
+        );
+
+        let unparented =
+            updated.with_records(&[dep_record("dep_remove", "c", "parent-child", "p")]);
+        assert!(unparented.tree_children("p").is_empty());
+        assert_eq!(unparented.roots(), &["p", "c"]);
+
+        let reparented = unparented.with_records(&[
+            dep_record("dep_add", "c", "parent-child", "p"),
+            dep_record("dep_add", "c", "parent-child", "p"),
+        ]);
+        assert_eq!(reparented.tree_children("p"), &["c"]);
+        assert_eq!(
+            reparented.issue("c").unwrap().dependencies.len(),
+            1,
+            "dep_add is an upsert"
+        );
+    }
+
+    #[test]
+    fn parses_journal_lines_from_bd_events_tail() {
+        let record: JournalRecord = serde_json::from_str(
+            r#"{"seq":3,"ts":"2026-10-15T06:42:59Z","op":"dep_add","issue_id":"t-1","actor":"me","issue":{"id":"t-1","title":"Child","status":"open","priority":2,"labels":["x"],"metadata":{"k":"v"}},"dep":{"kind":"parent-child","target":"t-0","metadata":"{}"}}"#,
+        )
+        .unwrap();
+        assert_eq!(record.issue.unwrap().title, "Child");
+        assert_eq!(record.dep.unwrap().target, "t-0");
+
+        let deleted: JournalRecord =
+            serde_json::from_str(r#"{"seq":4,"op":"delete","issue_id":"t-1","issue":null}"#)
+                .unwrap();
+        assert!(deleted.issue.is_none());
+
+        let refusal = r#"{"code":"events_journal_truncated","floor":41,"head":980,"since":12}"#;
+        assert!(serde_json::from_str::<JournalRecord>(refusal).is_err());
+    }
+
     #[test]
     fn replacing_issue_refreshes_its_description() {
         let mut graph = IssueGraph::new(vec![issue("a", &[])], vec![]);
@@ -528,60 +792,26 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn load_lists_open_and_in_progress_issues_by_default() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let script =
-            std::env::temp_dir().join(format!("be-fake-bd-load-{}-{nonce}", std::process::id()));
-        fs::write(
-            &script,
-            "#!/bin/sh\nprintf '%s\\n' '[{\"id\":\"open\",\"status\":\"open\"},{\"id\":\"working\",\"status\":\"in_progress\"},{\"id\":\"closed\",\"status\":\"closed\"}]'\n",
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions).unwrap();
+        let fake = FakeBd::new(
+            "load",
+            r#"[{"id":"open","status":"open"},{"id":"working","status":"in_progress"},{"id":"closed","status":"closed"}]"#,
+        );
 
-        let graph = Bd::new(script.clone().into_os_string(), None)
-            .load()
-            .unwrap();
+        let graph = fake.bd(None).load().unwrap();
 
         assert!(graph.is_listed("open"));
         assert!(graph.is_listed("working"));
         assert!(!graph.is_listed("closed"));
         assert_eq!(graph.len(), 2);
-
-        let _ = fs::remove_file(script);
     }
 
     #[cfg(unix)]
     #[test]
     fn create_issue_passes_parent_type_and_p1_to_bd() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir();
-        let script = directory.join(format!("be-fake-bd-{}-{nonce}", std::process::id()));
-        let arguments = directory.join(format!("be-fake-bd-args-{}-{nonce}", std::process::id()));
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'child-1\\n'\n",
-                arguments.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions).unwrap();
+        let fake = FakeBd::new("create", "child-1");
 
-        let bd = Bd::new(
-            script.clone().into_os_string(),
-            Some(PathBuf::from("/tmp/example.db")),
-        );
-        let issue_id = bd
+        let issue_id = fake
+            .bd(Some(PathBuf::from("/tmp/example.db")))
             .create_issue(&AddIssueDraft {
                 parent_id: Some("parent-1".into()),
                 title: "Child title".into(),
@@ -593,11 +823,8 @@ mod tests {
 
         assert_eq!(issue_id, "child-1");
         assert_eq!(
-            fs::read_to_string(&arguments)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec![
+            fake.arguments(),
+            [
                 "create",
                 "Child title",
                 "--description",
@@ -613,37 +840,15 @@ mod tests {
                 "/tmp/example.db",
             ]
         );
-
-        let _ = fs::remove_file(script);
-        let _ = fs::remove_file(arguments);
     }
 
     #[cfg(unix)]
     #[test]
     fn create_issue_without_parent_omits_the_parent_flag() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir();
-        let script = directory.join(format!("be-fake-bd-root-{}-{nonce}", std::process::id()));
-        let arguments = directory.join(format!(
-            "be-fake-bd-root-args-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'root-1\\n'\n",
-                arguments.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions).unwrap();
+        let fake = FakeBd::new("root", "root-1");
 
-        let issue_id = Bd::new(script.clone().into_os_string(), None)
+        let issue_id = fake
+            .bd(None)
             .create_issue(&AddIssueDraft {
                 parent_id: None,
                 title: "Top level".into(),
@@ -654,49 +859,23 @@ mod tests {
             .unwrap();
 
         assert_eq!(issue_id, "root-1");
-        let recorded = fs::read_to_string(&arguments).unwrap();
-        assert!(!recorded.lines().any(|argument| argument == "--parent"));
-        assert!(recorded.lines().any(|argument| argument == "--silent"));
-
-        let _ = fs::remove_file(script);
-        let _ = fs::remove_file(arguments);
+        let recorded = fake.arguments();
+        assert!(!recorded.iter().any(|argument| argument == "--parent"));
+        assert!(recorded.iter().any(|argument| argument == "--silent"));
     }
 
     #[cfg(unix)]
     #[test]
     fn set_status_and_priority_run_bd_update() {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let directory = std::env::temp_dir();
-        let script = directory.join(format!("be-fake-bd-update-{}-{nonce}", std::process::id()));
-        let arguments = directory.join(format!(
-            "be-fake-bd-update-args-{}-{nonce}",
-            std::process::id()
-        ));
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\n",
-                arguments.display()
-            ),
-        )
-        .unwrap();
-        let mut permissions = fs::metadata(&script).unwrap().permissions();
-        permissions.set_mode(0o700);
-        fs::set_permissions(&script, permissions).unwrap();
+        let fake = FakeBd::new("update", "");
 
-        let bd = Bd::new(script.clone().into_os_string(), None);
+        let bd = fake.bd(None);
         bd.set_status("task-1", "in_progress").unwrap();
         bd.set_priority("task-1", 2).unwrap();
 
         assert_eq!(
-            fs::read_to_string(&arguments)
-                .unwrap()
-                .lines()
-                .collect::<Vec<_>>(),
-            vec![
+            fake.arguments(),
+            [
                 "update",
                 "task-1",
                 "--status",
@@ -707,8 +886,47 @@ mod tests {
                 "P2",
             ]
         );
+    }
 
-        let _ = fs::remove_file(script);
-        let _ = fs::remove_file(arguments);
+    #[cfg(unix)]
+    fn journal_head_from(body: &str) -> io::Result<JournalHead> {
+        FakeBd::script("head", body).bd(None).journal_head()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_head_is_the_seq_of_the_last_record() {
+        let head = journal_head_from(
+            r#"printf '%s\n' '{"seq":6,"op":"create","issue_id":"a","issue":{"id":"a"}}' '{"seq":7,"op":"delete","issue_id":"a","issue":null}'"#,
+        );
+        assert_eq!(head.unwrap(), JournalHead::At(7));
+        assert_eq!(journal_head_from(":").unwrap(), JournalHead::At(0));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_head_reports_a_disabled_journal() {
+        let head = journal_head_from(
+            r#"echo "note: the events journal is disabled for this workspace (enable with ...)" >&2"#,
+        );
+        assert_eq!(head.unwrap(), JournalHead::Disabled);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_head_reads_a_pruned_journal_from_its_refusal() {
+        let head = journal_head_from(
+            r#"printf '{\n  "code": "events_journal_truncated",\n  "floor": 41,\n  "head": 980,\n  "since": 0\n}\n'; exit 1"#,
+        );
+        assert_eq!(head.unwrap(), JournalHead::At(980));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn journal_head_fails_on_a_bd_without_events() {
+        let error =
+            journal_head_from(r#"echo 'Error: unknown command "events" for "bd"' >&2; exit 1"#)
+                .unwrap_err();
+        assert!(error.to_string().contains("unknown command"), "{error}");
     }
 }

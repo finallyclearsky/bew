@@ -7,6 +7,8 @@ const EDIT_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(500);
 
 pub const ISSUE_TYPES: [&str; 6] = ["task", "bug", "feature", "epic", "chore", "decision"];
 pub const PRIORITIES: [i32; 5] = [0, 1, 2, 3, 4];
+/// P1, the priority preselected when an issue has none of `PRIORITIES`.
+pub const DEFAULT_PRIORITY_INDEX: usize = 1;
 pub const STATUSES: [&str; 5] = ["open", "in_progress", "blocked", "deferred", "closed"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +77,18 @@ pub enum AddIssueField {
 pub enum PickerKind {
     Status,
     Priority,
+}
+
+impl PickerKind {
+    /// The option index of `issue`'s current value, if it is one of the options.
+    fn current_index(self, issue: &Issue) -> Option<usize> {
+        match self {
+            Self::Status => STATUSES.iter().position(|status| *status == issue.status),
+            Self::Priority => PRIORITIES
+                .iter()
+                .position(|priority| *priority == issue.priority),
+        }
+    }
 }
 
 /// A floating single-choice menu for updating the current issue in place.
@@ -329,11 +343,34 @@ impl App {
             Mode::ConfirmClose(_) => self.handle_confirm_close_key(key),
             Mode::Search { .. } => self.handle_search_key(key),
             Mode::Picker(_) => self.handle_picker_key(key),
-            Mode::Normal => match self.screen() {
-                Screen::Tree => self.handle_tree_key(key),
-                Screen::Detail => self.handle_detail_key(key),
-            },
+            Mode::Normal => {
+                if let Some(action) = self.resolve_edit_chord(&key) {
+                    return action;
+                }
+                if self.handle_issue_key(key.code) {
+                    return Action::None;
+                }
+                match self.screen() {
+                    Screen::Tree => self.handle_tree_key(key),
+                    Screen::Detail => self.handle_detail_key(key),
+                }
+            }
         }
+    }
+
+    /// Keys that act on `current_issue()` the same way on both screens;
+    /// returns whether `code` was one of them.
+    fn handle_issue_key(&mut self, code: KeyCode) -> bool {
+        match code {
+            KeyCode::Char('e') if self.current_issue().is_some() => {
+                self.edit_key_started = Some(Instant::now());
+            }
+            KeyCode::Char('s') => self.start_picker(PickerKind::Status),
+            KeyCode::Char('p') => self.start_picker(PickerKind::Priority),
+            KeyCode::Char('x') => self.start_close_confirmation(),
+            _ => return false,
+        }
+        true
     }
 
     fn handle_confirm_close_key(&mut self, key: KeyEvent) -> Action {
@@ -388,9 +425,6 @@ impl App {
     }
 
     fn handle_tree_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(action) = self.resolve_edit_chord(&key) {
-            return action;
-        }
         if key.code == KeyCode::Char('/') {
             self.start_search();
             return Action::None;
@@ -409,14 +443,7 @@ impl App {
             KeyCode::Tab => self.toggle(),
             KeyCode::Char('l') | KeyCode::Right => self.expand_or_enter(),
             KeyCode::Char('h') | KeyCode::Left => self.collapse_or_parent(),
-            KeyCode::Enter if self.selected_row_is_create_entry() => self.start_add_issue(None),
-            KeyCode::Enter => self.open_selected_issue(),
-            KeyCode::Char('e') if self.current_tree_issue().is_some() => {
-                self.edit_key_started = Some(Instant::now());
-            }
-            KeyCode::Char('s') => self.start_picker(PickerKind::Status),
-            KeyCode::Char('p') => self.start_picker(PickerKind::Priority),
-            KeyCode::Char('x') => self.start_close_confirmation(),
+            KeyCode::Enter => self.open_selected_row(),
             KeyCode::Char('+') => {
                 let parent_id = self.current_tree_issue().map(|issue| issue.id.clone());
                 self.start_add_issue(parent_id);
@@ -425,12 +452,6 @@ impl App {
             _ => {}
         }
         Action::None
-    }
-
-    fn selected_row_is_create_entry(&self) -> bool {
-        self.rows
-            .get(self.cursor)
-            .is_some_and(TreeRow::is_create_entry)
     }
 
     fn handle_search_key(&mut self, key: KeyEvent) -> Action {
@@ -473,10 +494,6 @@ impl App {
     }
 
     fn handle_detail_key(&mut self, key: KeyEvent) -> Action {
-        if let Some(action) = self.resolve_edit_chord(&key) {
-            return action;
-        }
-
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => self.move_dependency_cursor(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_dependency_cursor(-1),
@@ -495,17 +512,10 @@ impl App {
                 }
             }
             KeyCode::Enter => self.open_selected_dependency(),
-            KeyCode::Char('e') if self.current_detail_issue().is_some() => {
-                self.edit_key_started = Some(Instant::now());
-            }
-            KeyCode::Char('s') => self.start_picker(PickerKind::Status),
-            KeyCode::Char('p') => self.start_picker(PickerKind::Priority),
-            KeyCode::Char('x') if self.can_close_current_issue() => {
-                self.start_close_confirmation();
-            }
-            KeyCode::Char('+') if self.current_detail_issue().is_some() => {
-                let parent_id = self.current_detail_issue().map(|issue| issue.id.clone());
-                self.start_add_issue(parent_id);
+            KeyCode::Char('+') => {
+                if let Some(parent_id) = self.current_detail_issue().map(|issue| issue.id.clone()) {
+                    self.start_add_issue(Some(parent_id));
+                }
             }
             KeyCode::Backspace => {
                 self.history.pop();
@@ -565,34 +575,14 @@ impl App {
                 _ => {}
             },
             AddIssueStep::IssueType => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    flow.issue_type_index = (flow.issue_type_index + 1).min(ISSUE_TYPES.len() - 1);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    flow.issue_type_index = flow.issue_type_index.saturating_sub(1);
-                }
-                KeyCode::Char('g') | KeyCode::Home => flow.issue_type_index = 0,
-                KeyCode::Char('G') | KeyCode::End => {
-                    flow.issue_type_index = ISSUE_TYPES.len() - 1;
-                }
                 KeyCode::Enter => flow.step = AddIssueStep::Priority,
                 KeyCode::Backspace => flow.step = AddIssueStep::Description,
-                _ => {}
+                code => move_selection(&mut flow.issue_type_index, ISSUE_TYPES.len(), code),
             },
             AddIssueStep::Priority => match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    flow.priority_index = (flow.priority_index + 1).min(PRIORITIES.len() - 1);
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    flow.priority_index = flow.priority_index.saturating_sub(1);
-                }
-                KeyCode::Char('g') | KeyCode::Home => flow.priority_index = 0,
-                KeyCode::Char('G') | KeyCode::End => {
-                    flow.priority_index = PRIORITIES.len() - 1;
-                }
                 KeyCode::Enter => return Action::CreateIssue(flow.draft()),
                 KeyCode::Backspace => flow.step = AddIssueStep::IssueType,
-                _ => {}
+                code => move_selection(&mut flow.priority_index, PRIORITIES.len(), code),
             },
         }
         Action::None
@@ -602,17 +592,22 @@ impl App {
         let Mode::Picker(picker) = &mut self.mode else {
             return Action::None;
         };
-        let last = picker.options().len() - 1;
+        let len = picker.options().len();
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => picker.index = (picker.index + 1).min(last),
-            KeyCode::Char('k') | KeyCode::Up => picker.index = picker.index.saturating_sub(1),
-            KeyCode::Char('g') | KeyCode::Home => picker.index = 0,
-            KeyCode::Char('G') | KeyCode::End => picker.index = last,
             KeyCode::Esc => self.mode = Mode::Normal,
             KeyCode::Enter => {
                 let Mode::Picker(picker) = std::mem::replace(&mut self.mode, Mode::Normal) else {
                     return Action::None;
                 };
+                // Confirming the preselected value would be a no-op `bd update`.
+                let unchanged = self
+                    .graph
+                    .issue(&picker.issue_id)
+                    .and_then(|issue| picker.kind.current_index(issue))
+                    == Some(picker.index);
+                if unchanged {
+                    return Action::None;
+                }
                 return match picker.kind {
                     PickerKind::Status => {
                         Action::SetStatus(picker.issue_id, STATUSES[picker.index])
@@ -622,7 +617,7 @@ impl App {
                     }
                 };
             }
-            _ => {}
+            code => move_selection(&mut picker.index, len, code),
         }
         Action::None
     }
@@ -631,18 +626,11 @@ impl App {
         let Some(issue) = self.current_issue() else {
             return;
         };
-        let index = match kind {
-            PickerKind::Status => STATUSES
-                .iter()
-                .position(|status| *status == issue.status)
-                .unwrap_or(0),
-            PickerKind::Priority => PRIORITIES
-                .iter()
-                .position(|priority| *priority == issue.priority)
-                .unwrap_or(1),
-        };
+        let index = kind.current_index(issue).unwrap_or(match kind {
+            PickerKind::Status => 0,
+            PickerKind::Priority => DEFAULT_PRIORITY_INDEX,
+        });
         let issue_id = issue.id.clone();
-        self.edit_key_started = None;
         self.mode = Mode::Picker(Picker {
             kind,
             issue_id,
@@ -666,17 +654,20 @@ impl App {
         }
     }
 
-    fn open_selected_issue(&mut self) {
-        if let Some(row) = self.rows.get(self.cursor) {
-            if row.is_create_entry() {
-                return;
-            }
-            self.history.push(DetailFrame {
-                issue_id: row.issue_id.clone(),
-                dependency_cursor: 0,
-                scroll: 0,
-            });
+    /// Opens the selected issue, or starts a top-level add on the create entry.
+    fn open_selected_row(&mut self) {
+        let Some(row) = self.rows.get(self.cursor) else {
+            return;
+        };
+        if row.is_create_entry() {
+            self.start_add_issue(None);
+            return;
         }
+        self.history.push(DetailFrame {
+            issue_id: row.issue_id.clone(),
+            dependency_cursor: 0,
+            scroll: 0,
+        });
     }
 
     fn start_close_confirmation(&mut self) {
@@ -690,14 +681,13 @@ impl App {
     }
 
     fn start_add_issue(&mut self, parent_id: Option<String>) {
-        self.edit_key_started = None;
         self.mode = Mode::AddIssue(AddIssueFlow {
             parent_id,
             title: String::new(),
             description: String::new(),
             step: AddIssueStep::Title,
             issue_type_index: 0,
-            priority_index: 1,
+            priority_index: DEFAULT_PRIORITY_INDEX,
             confirming_cancel: false,
         });
     }
@@ -1005,6 +995,18 @@ impl App {
             }
         }
         self.cursor = self.cursor.min(self.rows.len().saturating_sub(1));
+    }
+}
+
+/// Moves a list selection with j/k/g/G or the arrow, Home and End keys.
+fn move_selection(index: &mut usize, len: usize, code: KeyCode) {
+    let last = len - 1;
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => *index = (*index + 1).min(last),
+        KeyCode::Char('k') | KeyCode::Up => *index = index.saturating_sub(1),
+        KeyCode::Char('g') | KeyCode::Home => *index = 0,
+        KeyCode::Char('G') | KeyCode::End => *index = last,
+        _ => {}
     }
 }
 
@@ -1655,6 +1657,15 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
         assert!(app.picker().is_none());
         assert_eq!(app.screen(), Screen::Tree);
+    }
+
+    #[test]
+    fn confirming_the_preselected_value_closes_the_picker_without_an_update() {
+        let mut app = App::new(graph());
+        app.handle_key(key(KeyCode::Char('p')));
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(app.picker().is_none());
     }
 
     #[test]

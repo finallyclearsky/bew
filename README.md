@@ -16,6 +16,16 @@ If you'd rather skip the script: `cargo install --git https://github.com/finally
 
 Then run `be` anywhere that `bd list` works. The tree shows issues whose status is `open`; non-open dependencies remain available when navigating through Task View. Use `be --db path/to/.beads` to select a database explicitly, or `--bd path/to/bd` (env: `BEADS_EXPLORER_BD`) to point at a specific `bd` executable.
 
+## Live updates
+
+With beads 1.3 or later, `be` shows changes made elsewhere — by agents, scripts, or another terminal — within about a second, without a restart. It follows the workspace's [events journal](https://beads.gascity.com/reference/events-journal), which is off by default:
+
+```sh
+bd config set events-journal true
+```
+
+This writes `.beads/config.yaml`, so every `bd` that writes to the workspace records its changes from then on. Without the journal, `be` says so on startup and reloads only after its own writes, as before. The journal does not record `bd dolt pull`, so restart `be` after a sync to see the pulled changes.
+
 ## Navigation
 
 | Key | Tree | Task view |

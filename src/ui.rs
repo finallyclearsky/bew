@@ -1,5 +1,6 @@
 use crate::app::{
-    AddIssueFlow, AddIssueStep, App, Picker, PickerKind, Screen, ISSUE_TYPES, PRIORITIES,
+    AddIssueFlow, AddIssueStep, App, Picker, PickerKind, Screen, DEFAULT_PRIORITY_INDEX,
+    ISSUE_TYPES, PRIORITIES,
 };
 use crate::model::Issue;
 use crossterm::cursor::MoveTo;
@@ -84,11 +85,11 @@ fn draw_tree(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> io
     app.viewport = list_height.max(1);
     let mut content_end: u16 = 1;
     if app.rows.is_empty() {
-        let message = if let Some(query) = app.search_query() {
-            format!("No issue IDs match /{query}")
-        } else {
-            "No issues found. Create one with `bd create`.".to_string()
-        };
+        // Only a search can empty the rows; otherwise the create entry is there.
+        let message = format!(
+            "No issue IDs match /{}",
+            app.search_query().unwrap_or_default()
+        );
         queue!(
             out,
             MoveTo(0, 1),
@@ -252,13 +253,10 @@ fn draw_detail(app: &mut App, out: &mut impl Write, width: u16, height: u16) -> 
         return draw_status_line(out, width, height, status);
     }
 
-    let footer = if app.can_close_current_issue() {
-        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority · x close · Backspace back · Esc tree · q quit"
-            .to_string()
-    } else {
-        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority · Backspace back · Esc tree · q quit"
-            .to_string()
-    };
+    let footer = format!(
+        "+ add child · j/k dependency · Enter open · e edit · et title · s status · p priority{} · Backspace back · Esc tree · q quit",
+        if app.can_close_current_issue() { " · x close" } else { "" }
+    );
     queue!(
         out,
         MoveTo(0, height - 1),
@@ -308,21 +306,20 @@ fn draw_picker(out: &mut impl Write, width: u16, height: u16, picker: &Picker) -
         PickerKind::Status => format!(" Set status · {} ", picker.issue_id),
         PickerKind::Priority => format!(" Set priority · {} ", picker.issue_id),
     };
-    let mut lines: Vec<String> = picker
-        .options()
-        .iter()
-        .enumerate()
-        .map(|(index, option)| {
-            format!(
-                "{} {}",
-                if index == picker.index { "›" } else { " " },
-                option
-            )
-        })
-        .collect();
+    let mut lines: Vec<String> = choice_lines(picker.options(), picker.index).collect();
     lines.push(String::new());
     lines.push("j/k or ↑/↓ select · Enter apply · Esc cancel".to_string());
     draw_floating_modal(out, width, height, &title, &lines)
+}
+
+/// One line per option, with `›` marking the selected one.
+fn choice_lines<T: std::fmt::Display>(
+    options: impl IntoIterator<Item = T>,
+    selected: usize,
+) -> impl Iterator<Item = String> {
+    options.into_iter().enumerate().map(move |(index, option)| {
+        format!("{} {option}", if index == selected { "›" } else { " " })
+    })
 }
 
 fn draw_close_confirmation(
@@ -372,35 +369,22 @@ fn draw_add_issue(
         }
         AddIssueStep::IssueType => {
             lines.push("Select issue type".to_string());
-            lines.extend(ISSUE_TYPES.iter().enumerate().map(|(index, issue_type)| {
-                format!(
-                    "{} {}",
-                    if index == flow.issue_type_index {
-                        "›"
-                    } else {
-                        " "
-                    },
-                    issue_type
-                )
-            }));
+            lines.extend(choice_lines(ISSUE_TYPES, flow.issue_type_index));
             lines.push(
                 "j/k or ↑/↓ select · Enter continue · Backspace previous · Esc cancel".to_string(),
             );
         }
         AddIssueStep::Priority => {
             lines.push("Select priority (P1 is the default)".to_string());
-            lines.extend(PRIORITIES.iter().enumerate().map(|(index, priority)| {
-                format!(
-                    "{} P{}{}",
-                    if index == flow.priority_index {
-                        "›"
-                    } else {
-                        " "
-                    },
-                    priority,
-                    if *priority == 1 { "  default" } else { "" }
-                )
-            }));
+            let priorities = PRIORITIES.iter().enumerate().map(|(index, priority)| {
+                let default = if index == DEFAULT_PRIORITY_INDEX {
+                    "  default"
+                } else {
+                    ""
+                };
+                format!("P{priority}{default}")
+            });
+            lines.extend(choice_lines(priorities, flow.priority_index));
             lines.push(
                 "j/k or ↑/↓ select · Enter create · Backspace previous · Esc cancel".to_string(),
             );

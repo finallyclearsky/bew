@@ -1,4 +1,5 @@
 use beads_explorer::app::{Action, App};
+use beads_explorer::live::LiveUpdates;
 use beads_explorer::model::{Bd, IssueGraph};
 use beads_explorer::ui;
 use crossterm::cursor::{Hide, Show};
@@ -18,6 +19,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// How often the event loop wakes to check on a background close.
 const CLOSE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// How often the event loop wakes to apply live updates; `bd events tail
+/// --follow` itself polls the journal once a second.
+const LIVE_POLL_INTERVAL: Duration = Duration::from_millis(250);
+
 const HELP: &str = "beads explorer
 
 Usage: be [OPTIONS]
@@ -36,6 +41,9 @@ Both:      e edit description · et edit title · s set status · p set priority
 
 Add issue: Enter advances · j/k selects type/priority · e opens $EDITOR for text
            Backspace returns to the previous selection · Esc asks before discarding
+
+Live updates need bd 1.3 or later and the workspace's events journal:
+           bd config set events-journal true
 ";
 
 enum CloseOutcome {
@@ -196,44 +204,39 @@ fn read_key_action(app: &mut App) -> io::Result<Action> {
     })
 }
 
-/// Blocks for the next key unless a pending `e` chord or background close
-/// needs the loop to wake up on a timeout.
-fn next_action(app: &mut App, close_pending: bool) -> io::Result<Action> {
-    let key_timeout = app.pending_key_timeout();
-    let timeout = if close_pending {
-        Some(key_timeout.map_or(CLOSE_POLL_INTERVAL, |timeout| {
-            timeout.min(CLOSE_POLL_INTERVAL)
-        }))
-    } else {
-        key_timeout
+/// Waits for the next terminal event, waking early after `wake_after` or
+/// when a pending `e` chord times out. `None` means it woke with nothing to do.
+fn next_action(app: &mut App, wake_after: Option<Duration>) -> io::Result<Option<Action>> {
+    let timeout = match (app.pending_key_timeout(), wake_after) {
+        (Some(key_timeout), Some(wake_after)) => Some(key_timeout.min(wake_after)),
+        (key_timeout, wake_after) => key_timeout.or(wake_after),
     };
     let Some(timeout) = timeout else {
-        return read_key_action(app);
+        return read_key_action(app).map(Some);
     };
     if event::poll(timeout)? {
-        read_key_action(app)
+        read_key_action(app).map(Some)
     } else if app
         .pending_key_timeout()
         .is_some_and(|remaining| remaining.is_zero())
     {
-        Ok(app.flush_pending_key())
+        Ok(Some(app.flush_pending_key()))
     } else {
-        Ok(Action::None)
+        Ok(None)
     }
 }
 
-/// Applies a finished `bd update`, reloading the whole graph on success since
-/// a status change can move an issue in or out of the tree.
-fn apply_update(app: &mut App, bd: &Bd, result: io::Result<()>, success: String) {
-    match result {
-        Ok(()) => match bd.load() {
-            Ok(graph) => {
-                app.refresh_graph(graph);
-                app.set_status(success);
-            }
-            Err(error) => app.set_status(format!("{error} · view may be stale")),
-        },
-        Err(error) => app.set_status(error.to_string()),
+/// Reloads the whole graph after a successful `bd` write, since a create or a
+/// status change can move issues in or out of the tree.
+fn reload_after_write(app: &mut App, bd: &Bd, success: String) {
+    match bd.load() {
+        Ok(graph) => {
+            app.refresh_graph(graph);
+            app.set_status(success);
+        }
+        Err(error) => app.set_status(format!(
+            "{success}, but reload failed: {error} · view may be stale"
+        )),
     }
 }
 
@@ -249,14 +252,36 @@ fn run(bd: Bd) -> io::Result<()> {
     guard.activate(&mut out)?;
 
     let mut pending_close: Option<PendingClose> = None;
+    let mut live = LiveUpdates::spawn(&bd);
+    // Live updates wake the loop several times a second, so draw only after
+    // something changed.
+    let mut needs_draw = true;
 
     loop {
-        pending_close = pending_close.and_then(|pending| pending.poll(&mut app));
+        if let Some(pending) = pending_close.take() {
+            pending_close = pending.poll(&mut app);
+            needs_draw |= pending_close.is_none();
+        }
+        needs_draw |= live.poll(&mut app);
 
-        let (width, height) = terminal::size()?;
-        ui::draw(&mut app, &mut out, width, height)?;
+        if needs_draw {
+            let (width, height) = terminal::size()?;
+            ui::draw(&mut app, &mut out, width, height)?;
+            needs_draw = false;
+        }
 
-        match next_action(&mut app, pending_close.is_some())? {
+        let wake_after = if pending_close.is_some() {
+            Some(CLOSE_POLL_INTERVAL)
+        } else if live.is_following() {
+            Some(LIVE_POLL_INTERVAL)
+        } else {
+            None
+        };
+        let Some(action) = next_action(&mut app, wake_after)? else {
+            continue;
+        };
+        needs_draw = true;
+        match action {
             Action::Quit => break,
             Action::CloseIssue(_)
             | Action::Edit(_)
@@ -307,31 +332,20 @@ fn run(bd: Bd) -> io::Result<()> {
                         Some(parent_id) => format!("Created {issue_id} under {parent_id}"),
                         None => format!("Created {issue_id}"),
                     };
-                    match bd.load() {
-                        Ok(graph) => {
-                            app.refresh_graph(graph);
-                            app.set_status(created);
-                        }
-                        Err(error) => app.set_status(format!(
-                            "Created {issue_id}, but reload failed: {error} · view may be stale"
-                        )),
-                    }
+                    reload_after_write(&mut app, &bd, created);
                 }
                 Err(error) => app.set_status(error.to_string()),
             },
-            Action::SetStatus(issue_id, status) => {
-                let result = bd.set_status(&issue_id, status);
-                apply_update(&mut app, &bd, result, format!("Set {issue_id} to {status}"));
-            }
-            Action::SetPriority(issue_id, priority) => {
-                let result = bd.set_priority(&issue_id, priority);
-                apply_update(
-                    &mut app,
-                    &bd,
-                    result,
-                    format!("Set {issue_id} to P{priority}"),
-                );
-            }
+            Action::SetStatus(issue_id, status) => match bd.set_status(&issue_id, status) {
+                Ok(()) => reload_after_write(&mut app, &bd, format!("Set {issue_id} to {status}")),
+                Err(error) => app.set_status(error.to_string()),
+            },
+            Action::SetPriority(issue_id, priority) => match bd.set_priority(&issue_id, priority) {
+                Ok(()) => {
+                    reload_after_write(&mut app, &bd, format!("Set {issue_id} to P{priority}"))
+                }
+                Err(error) => app.set_status(error.to_string()),
+            },
             Action::None => {}
         }
     }
