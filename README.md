@@ -9,7 +9,7 @@ https://github.com/user-attachments/assets/206a634c-8ced-4588-ae28-14b8174a9a3a
 You need [Rust](https://rustup.rs) to build it and [`bd`](https://github.com/gastownhall/beads) to run it. Agent panes also need tmux.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/finallyclearsky/beads-explorer/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/finallyclearsky/bew/main/install.sh | sh
 ```
 
 This builds `bew` and puts it in `~/.local/bin`. Set `BIN_DIR` to install somewhere else. To remove it, delete the binary.
