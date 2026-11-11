@@ -2,7 +2,7 @@
 
 `bew` is a minimal terminal workspace for [beads](https://github.com/gastownhall/beads) issues. Browse the issue tree, edit issues, and hand one to a coding agent in a tmux pane.
 
-https://github.com/user-attachments/assets/206a634c-8ced-4588-ae28-14b8174a9a3a
+https://github.com/user-attachments/assets/a9cc007e-1222-4e12-adbf-b5b5a20b7ee4
 
 ## Install
 
