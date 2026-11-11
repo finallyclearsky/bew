@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-REPO="https://github.com/finallyblueskies/beads-explorer"
+REPO="https://github.com/finallyclearsky/beads-explorer"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
 
 if ! command -v cargo >/dev/null 2>&1; then

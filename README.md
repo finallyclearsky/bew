@@ -1,54 +1,50 @@
 # bew
 
-`bew` is a terminal workspace for [beads](https://github.com/gastownhall/beads) issues. It shows the issue tree, edits issues through `bd`, and hands an issue to an agent in a tmux pane.
+`bew` is a minimal terminal workspace for [beads](https://github.com/gastownhall/beads) issues. Browse the issue tree, edit issues, and hand one to a coding agent in a tmux pane.
 
 https://github.com/user-attachments/assets/206a634c-8ced-4588-ae28-14b8174a9a3a
 
 ## Install
 
+You need [Rust](https://rustup.rs) to build it and [`bd`](https://github.com/gastownhall/beads) to run it. Agent panes also need tmux.
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/finallyblueskies/beads-explorer/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/finallyclearsky/beads-explorer/main/install.sh | sh
 ```
 
-This installs `bew` into `~/.local/bin`. To use another directory, run `curl ... | BIN_DIR=/some/path sh`. To uninstall, pipe `uninstall.sh` through `sh` the same way.
+This builds `bew` and puts it in `~/.local/bin`. Set `BIN_DIR` to install somewhere else. To remove it, delete the binary.
 
-Run `bew` anywhere that `bd list` works. Options: `--db path/to/.beads` selects a database; `--bd path/to/bd` (env: `BEW_BD`) selects the `bd` executable.
+## Use
 
-## Keys
+Run `bew` in any directory where `bd list` works.
 
-| Key | Tree | Task view |
-| --- | --- | --- |
-| `j` / `k`, arrows | Move | Select dependency |
-| `h` / `l`, Left / Right | Fold / expand | — |
-| `Tab` | Toggle fold | — |
-| `Enter` | Open task (`+ Create New`: add a top-level issue) | Open dependency |
-| `+` | Add a child issue | Add a child issue |
-| `e` / `ee` | Edit description in `$EDITOR` | Edit description in `$EDITOR` |
-| `et` | Edit title in `$EDITOR` | Edit title in `$EDITOR` |
-| `s` | Set status | Set status |
-| `p` | Set priority | Set priority |
-| `x`, then `y` | Close issue | Close issue |
-| `a` | Start an agent pane | Start an agent pane |
-| `f` | Focus the agent pane | Focus the agent pane |
-| `/` | Go to an issue ID (fuzzy) | — |
-| `Backspace` | — | Back |
-| `Esc` | Quit | Return to tree |
-| `q` | Quit | Quit |
+| Key | Action |
+| --- | --- |
+| `j` / `k` | Move |
+| `h` / `l` | Fold / expand |
+| `Enter` | Open the issue |
+| `Backspace` / `Esc` | Back / return to the tree |
+| `/` | Go to an issue by ID |
+| `+` | Add a child issue |
+| `e` / `et` | Edit the description / title in `$EDITOR` |
+| `s` / `p` | Set status / priority |
+| `x` | Close the issue |
+| `a` | Start an agent on the issue |
+| `f` | Focus the issue's agent pane |
+| `q` | Quit |
 
-In a step (status, priority, close, add issue), `Enter` applies and `Esc` cancels. In a text field, press `e` while it is empty to use `$EDITOR`.
+`bew --help` lists every key and option.
 
 ## Agents
 
-bew must run inside tmux. Press `a` to open `claude --effort medium "/ship <short-id>"` in `$EDITOR`. To run it, write the file. To cancel, quit without writing. bew runs it in a new pane to the right and binds the pane to the issue. bew does not change the issue.
+Run `bew` inside tmux. Press `a` on an issue and bew opens the agent command in `$EDITOR`, by default `claude --effort medium "/ship <id>"`. Change it to any command you like. Save to run it in a new pane on the right, or quit without saving to cancel.
 
-Press `f` to show the issue's pane again. A `●` marks issues with a live pane.
+A `●` marks issues with a live agent pane. Press `f` to jump to it.
 
 ## Live updates
 
-To see changes from other terminals and agents within a second, turn on the events journal:
+bew reloads every 10 seconds. To see changes from agents and other terminals as they land, turn on the events journal:
 
 ```sh
 bd config set events-journal true
 ```
-
-Without it, bew reloads every 10 seconds. bew also reloads when the terminal gains focus; in tmux, this needs `set -g focus-events on`.
